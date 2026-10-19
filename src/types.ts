@@ -37,11 +37,32 @@ export interface ArbiterVote {
 /** Lifecycle status of an invoice. */
 export type InvoiceStatus = "Pending" | "Released" | "Refunded" | "Cancelled";
 
+/** One recorded status change in an invoice's lifecycle. */
+export interface TransitionRecord {
+  from: InvoiceStatus;
+  to: InvoiceStatus;
+  /** Unix timestamp in seconds when the transition was applied. */
+  at: number;
+}
+
 /** Error thrown for invalid invoice state transitions. */
-export class InvalidTransitionError extends Error {
-  constructor(from: InvoiceStatus, to: InvoiceStatus) {
-    super(`Invalid transition from "${from}" to "${to}"`);
+export class InvalidTransitionError extends StellarSplitError {
+  readonly from: InvoiceStatus;
+  readonly to: InvoiceStatus;
+  /** The set of statuses `from` was allowed to transition to. */
+  readonly allowed: InvoiceStatus[];
+
+  constructor(from: InvoiceStatus, to: InvoiceStatus, allowed: InvoiceStatus[] = []) {
+    super(
+      `Invalid transition from "${from}" to "${to}"`,
+      "INVALID_TRANSITION",
+      { from, to, allowed },
+    );
     this.name = "InvalidTransitionError";
+    this.from = from;
+    this.to = to;
+    this.allowed = allowed;
+    Object.setPrototypeOf(this, new.target.prototype);
   }
 }
 
@@ -104,6 +125,109 @@ export interface Recipient {
 
 import { StellarSplitError } from "./errors.js";
 
+// ---------------------------------------------------------------------------
+// Split Rollback Coordinator Types
+// ---------------------------------------------------------------------------
+
+/** Lifecycle state of a single leg tracked by the rollback coordinator. */
+export type SplitLegState = "pending" | "succeeded" | "failed";
+
+/** A single recipient leg within a multi-recipient split payment. */
+export interface SplitLeg {
+  /** Stellar address of this leg's recipient. */
+  recipient: string;
+  /** Amount owed to this recipient, in stroops. */
+  amount: bigint;
+  /** Current reconciliation state of this leg. */
+  state: SplitLegState;
+}
+
+/** Result of submitting a multi-recipient split payment. */
+export interface SplitResult {
+  /** Identifier grouping the legs of this split (typically the tx hash). */
+  splitId: string;
+  /** Invoice this split payment was submitted for. */
+  invoiceId: string;
+  /** Transaction hash of the on-chain submission. */
+  txHash: string;
+  /** Per-recipient legs included in the split. */
+  legs: SplitLeg[];
+}
+
+/** A persistent checkpoint recording the intended legs of a split payment. */
+export interface SplitRollbackCheckpoint {
+  /** Identifier grouping the legs of this split. */
+  splitId: string;
+  /** Invoice this split payment was submitted for. */
+  invoiceId: string;
+  /** Unix epoch ms when the checkpoint was created. */
+  createdAt: number;
+  /** Per-recipient legs, in submission order. */
+  legs: SplitLeg[];
+}
+
+// ---------------------------------------------------------------------------
+// AMM Calculator Types
+// ---------------------------------------------------------------------------
+
+/** Estimated output and price impact for a pool swap. */
+export interface PoolSwapEstimate {
+  /** Expected output amount in stroops. */
+  outputAmount: string;
+  /** Price impact as a percentage string (e.g. "1.23"). */
+  priceImpactPercent: string;
+  /** Asset being sold into the pool. */
+  inputAsset: string;
+  /** Asset being received from the pool. */
+  outputAsset: string;
+  /** Effective swap price (output / input). */
+  effectivePrice: string;
+  /** Current spot price (reserveOut / reserveIn). */
+  spotPrice: string;
+}
+
+/** Proportional pool share for a given number of LP shares. */
+export interface PoolShareResult {
+  /** Proportional share of the first reserve asset in stroops. */
+  shareOfAssetA: string;
+  /** Proportional share of the second reserve asset in stroops. */
+  shareOfAssetB: string;
+  /** Asset identifier for the first reserve. */
+  assetA: string;
+  /** Asset identifier for the second reserve. */
+  assetB: string;
+  /** Total pool shares outstanding. */
+  totalShares: string;
+  /** Number of shares owned by the user. */
+  sharesOwned: string;
+  /** Ownership percentage (e.g. "5.50"). */
+  ownershipPercent: string;
+}
+
+// ---------------------------------------------------------------------------
+// Timeout Escalation Types
+// ---------------------------------------------------------------------------
+
+/** An escalation step that fires before the final payment deadline. */
+export interface EscalationStep {
+  /** Milliseconds before the deadline when this step triggers. */
+  triggerAtMs: number;
+  /** The action to take at this threshold. */
+  action: "warn" | "retryHigherFee" | "switchEndpoint" | "abort";
+  /** Fee multiplier for `retryHigherFee` action (default 1.5). */
+  feeMultiplier?: number;
+}
+
+/** Policy controlling timeout escalation behaviour. */
+export interface TimeoutPolicy {
+  /** Total deadline in milliseconds. */
+  deadlineMs: number;
+  /** Ordered escalation steps (closest to deadline first). */
+  escalations: EscalationStep[];
+}
+
+
+
 export interface HealthCheckResult {
   rpcReachable: boolean;
   latencyMs: number;
@@ -123,6 +247,42 @@ export class HealthCheckTimeoutError extends StellarSplitError {
 /**
  * Basic invoice data structure mirroring the Soroban contract.
  */
+
+/**
+ * Policy used to gate access to an invoice based on a minimum token balance.
+ *
+ * When `validFrom` or `validUntil` are provided the gate is only active
+ * during that time window. Outside the window the gate evaluates to `false`
+ * regardless of the caller's balance.
+ */
+export interface TokenGatePolicy {
+  /**
+   * The asset to check, in "CODE:ISSUER" format or "native" for XLM.
+   * @example "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+   */
+  asset: string;
+  /**
+   * Minimum balance required to pass the gate, as a decimal string.
+   * @example "10.0000000"
+   */
+  minBalance: string;
+  /**
+   * When `false`, a balance shortfall emits a warning instead of throwing.
+   * Defaults to `true`.
+   */
+  strict?: boolean;
+  /**
+   * Optional start of the gate's active window. Before this date the gate
+   * always returns `false` (or warns in non-strict mode).
+   */
+  validFrom?: Date;
+  /**
+   * Optional end of the gate's active window. After this date the gate
+   * always returns `false` (or warns in non-strict mode).
+   */
+  validUntil?: Date;
+}
+
 /** An on-chain StellarSplit invoice. */
 export interface Invoice {
   /** Invoice ID (u64 from the contract). */
@@ -135,6 +295,19 @@ export interface Invoice {
   token: string;
   /** Unix timestamp deadline (seconds). */
   deadline: number;
+  /**
+   * When the invoice was created. Accepted as a Unix timestamp in either
+   * seconds or milliseconds; helpers such as `getInvoiceAge` and
+   * `getFundingVelocity` detect the unit automatically by magnitude (values
+   * greater than 1e12 are treated as milliseconds). `0`, negative, and
+   * non-finite values are treated as "unknown" rather than as epoch 1970.
+   *
+   * Note: `hashInvoice()` canonicalises every key present on the invoice
+   * object, so populating this field changes an invoice's `contentHash`.
+   * Recompute any stored hashes before relying on `verifyInvoice()` or
+   * `submitPayment({ expectedContentHash })` for invoices that gain it.
+   */
+  createdAt?: number;
   /** Total amount funded so far in stroops. */
   funded: bigint;
   /** Current lifecycle status. */
@@ -153,10 +326,21 @@ export interface Invoice {
   groupId?: string;
   /** Ledger sequence when this invoice was last modified. */
   lastModifiedLedger?: number;
+  /**
+   * Optional free-form labels used for tag-based querying via
+   * `client.queryInvoices({ tags: [...] })`.
+   *
+   * When omitted, the query engine falls back to parsing `#hashtags` out of
+   * `memo`, so invoices created with a tagged memo are queryable without any
+   * contract change.
+   */
+  tags?: string[];
   /** IDs of invoices that must be paid before this one. */
   prerequisites?: string[];
   /** ID of the parent invoice this was cloned from (clone chain). */
   parentInvoiceId?: string;
+  /** Ordered record of status transitions applied via InvoiceStateMachine. */
+  statusHistory?: TransitionRecord[];
   /** Depth in the clone chain (0 = root, 1 = cloned from root, etc.). */
   cloneDepth?: number;
   /** The address of the NFT contract used for gating, if any. */
@@ -175,6 +359,11 @@ export interface Invoice {
   auto_resolve_rules?: AutoResolveRule[];
   /** ID of the single prerequisite invoice in this invoice's dependency chain. */
   prerequisite_id?: string;
+  /**
+   * Optional token-gate policy. When set, callers must hold the specified
+   * asset balance to read or interact with this invoice.
+   */
+  accessPolicy?: TokenGatePolicy;
 }
 
 /**
@@ -243,7 +432,14 @@ export interface InvoiceStats {
   totalPayers: number;
   /** Mean payment size in stroops (0 when there are no payments). */
   avgPayment: bigint;
-  /** Tokens funded per day since the first payment. */
+  /**
+   * Stroops funded per day across the payment window, i.e. the sum of payment
+   * amounts divided by the span between the first and last payment.
+   *
+   * This is deliberately different from the exported `getFundingVelocity()`,
+   * which is a lifetime average over the whole age of the invoice (`funded`
+   * since `createdAt`). Expect the two to disagree for the same invoice.
+   */
   fundingVelocity: number;
   /** Seconds from first to last payment once completed, else null. */
   timeToCompletion: number | null;
@@ -299,10 +495,32 @@ export interface CreateInvoiceParams {
   deadline: number;
   /** Optional memo / description. */
   memo?: string;
+  /**
+   * When `true`, simulate the transaction against Soroban RPC instead of
+   * submitting it, and resolve with a {@link SimulationResult} (issue #844).
+   * @default false
+   */
+  simulate?: boolean;
+  /**
+   * When `true`, skip the `RecipientBalancePreCheck` that normally runs
+   * before the invoice is submitted. Use only for advanced flows where you
+   * have already validated recipients independently.
+   * @default false
+   */
+  skipPreCheck?: boolean;
+  /**
+   * Horizon API URL used by the pre-check to load recipient accounts.
+   * Falls back to "https://horizon.stellar.org" when omitted.
+   */
+  horizonUrl?: string;
 }
 
 /** Generic hardware/software wallet adapter interface. */
 export interface WalletAdapter {
+  /** Unique wallet name (e.g., "Freighter", "LOBSTR", "xBull") */
+  name: string;
+  /** Connect to the wallet and return the Stellar public key */
+  connect(): Promise<string>;
   /** Return the Stellar public key (G... address) from the device. */
   getAddress(): Promise<string>;
   /**
@@ -313,6 +531,10 @@ export interface WalletAdapter {
    * @returns Signed transaction XDR.
    */
   signTransaction(xdr: string, network: string): Promise<string>;
+  /** Disconnect from the wallet */
+  disconnect(): void;
+  /** Register a handler for account change events. Returns an unsubscribe function. */
+  onAccountChange(handler: (address: string) => void): () => void;
 }
 
 /** Parameters for paying toward an invoice. */
@@ -328,6 +550,12 @@ export interface PayParams {
    * fails to reach its goal. Defaults to false.
    */
   donateOnFailure?: boolean;
+  /**
+   * When `true`, simulate the payment against Soroban RPC instead of
+   * submitting it, and resolve with a {@link SimulationResult} (issue #844).
+   * @default false
+   */
+  simulate?: boolean;
 }
 
 /** @deprecated Use PayParams instead. */
@@ -412,6 +640,43 @@ export interface SimulateCreateInvoiceResult {
 export interface SimulatePayResult {
   /** Estimated fee in stroops. */
   fee: string;
+}
+
+/** Result of a dry-run transaction simulation. */
+export interface SimulationResult {
+  /** Whether the simulation succeeded. */
+  success: boolean;
+  /** Error message if simulation failed. */
+  error?: string;
+  /** Estimated fee in stroops. */
+  fee: bigint;
+  /** CPU instructions used. */
+  cpuInsns: bigint;
+  /** Memory bytes used. */
+  memBytes: bigint;
+  /** Ledger footprint. */
+  footprint: LedgerFootprint;
+}
+
+/** Ledger footprint representing storage requirements. */
+export interface LedgerFootprint {
+  /** Read footprint in bytes. */
+  readBytes: bigint;
+  /** Write footprint in bytes. */
+  writeBytes: bigint;
+  /** Read ledger entries. */
+  readLedgerEntries: bigint;
+  /** Write ledger entries. */
+  writeLedgerEntries: bigint;
+}
+
+/** Lifecycle hooks for invoice events. */
+export interface InvoiceLifecycleHooks {
+  onCreated?: (invoice: Invoice) => void;
+  onPaid?: (invoice: Invoice, payment: Payment) => void;
+  onReleased?: (invoice: Invoice) => void;
+  onRefunded?: (invoice: Invoice) => void;
+  onCancelled?: (invoice: Invoice) => void;
 }
 
 /** Result of previewing a token swap via DEX contract. */
@@ -531,7 +796,60 @@ export interface CloneOverrides {
   newAmounts?: bigint[];
   newRecipients?: string[];
   newOverflowBehavior?: OverflowBehavior;
+  /**
+   * When `true`, skip the `InvoiceCloneabilityValidator` that normally runs
+   * before the clone is submitted. For advanced users who have already
+   * validated the source invoice independently.
+   * @default false
+   */
+  skipValidation?: boolean;
+  /**
+   * Horizon URL passed through to `InvoiceCloneabilityValidator` for
+   * recipient account lookups.
+   */
+  horizonUrl?: string;
+  /**
+   * Optional new title/memo stored on the cloned invoice.
+   * Serialised as the `new_title` entry of the clone override map (issue #850).
+   */
+  newTitle?: string;
 }
+
+/**
+ * Field-level overrides accepted by {@link StellarSplitClient.cloneInvoice}
+ * (issue #850). These are mapped onto the contract's `clone_invoice` override
+ * map after validation, mirroring the checks applied by `createInvoice`.
+ */
+export interface InvoiceParamOverrides {
+  /** Optional new title/memo for the cloned invoice (non-empty string). */
+  title?: string;
+  /** Optional new deadline as a future unix timestamp in seconds. */
+  deadline?: number;
+  /** Optional new total target amount in stroops (positive bigint). */
+  targetAmount?: bigint;
+  /** Optional replacement recipient addresses (must be valid Stellar addresses). */
+  recipients?: string[];
+}
+
+/**
+ * Options accepted by mutating methods to request a dry-run simulation
+ * against Soroban RPC instead of submitting a transaction (issue #844).
+ */
+export interface SimulateMutationOptions {
+  /**
+   * When `true`, the transaction is simulated and never submitted, and the
+   * method resolves with a {@link SimulationResult}.
+   * @default false
+   */
+  simulate?: boolean;
+}
+
+/**
+ * Result of a mutating client method that supports `{ simulate: true }`.
+ * Resolves with the real submission result, or a {@link SimulationResult}
+ * when simulation was requested.
+ */
+export type MaybeSimulated<T> = T | SimulationResult;
 
 /** Field names supported by read methods that can return partial objects. */
 export type InvoiceField = keyof Invoice;
@@ -623,6 +941,264 @@ export interface WeightedEndpoint {
   weight: number;
 }
 
+// ---------------------------------------------------------------------------
+// Invoice Event Subscription Types (Issue #417)
+// ---------------------------------------------------------------------------
+
+/** Invoice event types emitted by the StellarSplit contract. */
+export type InvoiceEventType =
+  | "created"
+  | "payment"
+  | "released"
+  | "refunded"
+  | "cancelled"
+  | "frozen"
+  | "unfrozen"
+  | "dispute_opened"
+  | "dispute_resolved"
+  | "split_rules_updated"
+  | "auto_resolve_rules_updated"
+  | "velocity_limit_updated"
+  | "prerequisite_added"
+  | "prerequisite_removed"
+  | "forward_chain_created"
+  | "scheduled_release_set"
+  | "penalty_tiers_updated"
+  | "allowed_callers_updated"
+  | "nft_gate_set"
+  | "nft_gate_removed";
+
+/** Base invoice event structure. */
+export interface BaseInvoiceEvent {
+  /** Invoice ID this event belongs to. */
+  invoiceId: string;
+  /** Ledger sequence number where event was emitted. */
+  ledger: number;
+  /** Unix timestamp when event was emitted. */
+  timestamp: number;
+  /** Unique event identifier for deduplication (ledger + topic hash). */
+  eventId: string;
+}
+
+/** Invoice created event. */
+export interface InvoiceCreatedEvent extends BaseInvoiceEvent {
+  type: "created";
+  creator: string;
+  recipients: Recipient[];
+  token: string;
+  deadline: number;
+}
+
+/** Payment received event. */
+export interface InvoicePaymentEvent extends BaseInvoiceEvent {
+  type: "payment";
+  payer: string;
+  amount: bigint;
+  donateOnFailure?: boolean;
+  payment?: Payment & { ledger: number; timestamp: number };
+}
+
+/** Invoice released event. */
+export interface InvoiceReleasedEvent extends BaseInvoiceEvent {
+  type: "released";
+  releasedBy: string;
+  amount: bigint;
+  totalAmount?: bigint;
+}
+
+/** Invoice refunded event. */
+export interface InvoiceRefundedEvent extends BaseInvoiceEvent {
+  type: "refunded";
+  refundedBy?: string;
+  refundedTo: string;
+  amount: bigint;
+  totalAmount?: bigint;
+}
+
+/** Invoice cancelled event. */
+export interface InvoiceCancelledEvent extends BaseInvoiceEvent {
+  type: "cancelled";
+  cancelledBy: string;
+}
+
+/** Invoice frozen event. */
+export interface InvoiceFrozenEvent extends BaseInvoiceEvent {
+  type: "frozen";
+  frozenBy: string;
+  reason: string;
+}
+
+/** Invoice unfrozen event. */
+export interface InvoiceUnfrozenEvent extends BaseInvoiceEvent {
+  type: "unfrozen";
+  unfrozenBy: string;
+}
+
+/** Dispute opened event. */
+export interface DisputeOpenedEvent extends BaseInvoiceEvent {
+  type: "dispute_opened";
+  disputeId: string;
+  openedBy: string;
+  reason: string;
+}
+
+/** Dispute resolved event. */
+export interface DisputeResolvedEvent extends BaseInvoiceEvent {
+  type: "dispute_resolved";
+  disputeId: string;
+  resolvedBy: string;
+  resolution: string;
+}
+
+/** Split rules updated event. */
+export interface SplitRulesUpdatedEvent extends BaseInvoiceEvent {
+  type: "split_rules_updated";
+  updatedBy: string;
+}
+
+/** Auto-resolve rules updated event. */
+export interface AutoResolveRulesUpdatedEvent extends BaseInvoiceEvent {
+  type: "auto_resolve_rules_updated";
+  updatedBy: string;
+}
+
+/** Velocity limit updated event. */
+export interface VelocityLimitUpdatedEvent extends BaseInvoiceEvent {
+  type: "velocity_limit_updated";
+  updatedBy: string;
+  limitPerWindow: bigint;
+  windowDuration: number;
+}
+
+/** Prerequisite added event. */
+export interface PrerequisiteAddedEvent extends BaseInvoiceEvent {
+  type: "prerequisite_added";
+  prerequisiteId: string;
+}
+
+/** Prerequisite removed event. */
+export interface PrerequisiteRemovedEvent extends BaseInvoiceEvent {
+  type: "prerequisite_removed";
+  prerequisiteId: string;
+}
+
+/** Forward chain created event. */
+export interface ForwardChainCreatedEvent extends BaseInvoiceEvent {
+  type: "forward_chain_created";
+  forwardInvoiceId: string;
+}
+
+/** Scheduled release set event. */
+export interface ScheduledReleaseSetEvent extends BaseInvoiceEvent {
+  type: "scheduled_release_set";
+  scheduledAt: number;
+}
+
+/** Penalty tiers updated event. */
+export interface PenaltyTiersUpdatedEvent extends BaseInvoiceEvent {
+  type: "penalty_tiers_updated";
+  updatedBy: string;
+}
+
+/** Allowed callers updated event. */
+export interface AllowedCallersUpdatedEvent extends BaseInvoiceEvent {
+  type: "allowed_callers_updated";
+  updatedBy: string;
+}
+
+/** NFT gate set event. */
+export interface NftGateSetEvent extends BaseInvoiceEvent {
+  type: "nft_gate_set";
+  contractAddress: string;
+}
+
+/** NFT gate removed event. */
+export interface NftGateRemovedEvent extends BaseInvoiceEvent {
+  type: "nft_gate_removed";
+}
+
+/** Union type of all possible invoice events. */
+export type InvoiceEvent =
+  | InvoiceCreatedEvent
+  | InvoicePaymentEvent
+  | InvoiceReleasedEvent
+  | InvoiceRefundedEvent
+  | InvoiceCancelledEvent
+  | InvoiceFrozenEvent
+  | InvoiceUnfrozenEvent
+  | DisputeOpenedEvent
+  | DisputeResolvedEvent
+  | SplitRulesUpdatedEvent
+  | AutoResolveRulesUpdatedEvent
+  | VelocityLimitUpdatedEvent
+  | PrerequisiteAddedEvent
+  | PrerequisiteRemovedEvent
+  | ForwardChainCreatedEvent
+  | ScheduledReleaseSetEvent
+  | PenaltyTiersUpdatedEvent
+  | AllowedCallersUpdatedEvent
+  | NftGateSetEvent
+  | NftGateRemovedEvent;
+
+/** Subscription configuration options. */
+export interface SubscriptionOptions {
+  /** Polling interval in milliseconds. Default: 3000. */
+  pollIntervalMs?: number;
+  /** Maximum number of reconnection retries. Default: 5. */
+  maxRetries?: number;
+  /** Initial backoff in milliseconds. Default: 1000. */
+  initialBackoffMs?: number;
+  /** Maximum backoff in milliseconds. Default: 30000. */
+  maxBackoffMs?: number;
+  /** Backoff multiplier for exponential backoff. Default: 2. */
+  backoffMultiplier?: number;
+  /** Optional callback for subscription lifecycle events. */
+  onLifecycleEvent?: (event: SubscriptionLifecycleEvent) => void;
+}
+
+/** Subscription lifecycle event types. */
+export interface SubscriptionErrorEvent {
+  type: "error";
+  invoiceId: string;
+  error: Error;
+  retryCount: number;
+  maxRetries: number;
+}
+
+export interface SubscriptionCloseEvent {
+  type: "close";
+  invoiceId: string;
+  reason: "unsubscribed" | "max_retries" | "error";
+}
+
+export interface SubscriptionReconnectEvent {
+  type: "reconnect";
+  invoiceId: string;
+  retryCount: number;
+  nextRetryMs: number;
+}
+
+export type SubscriptionLifecycleEvent =
+  | SubscriptionErrorEvent
+  | SubscriptionCloseEvent
+  | SubscriptionReconnectEvent;
+
+/** Subscription interface returned by subscribeInvoice. */
+export interface Subscription {
+  /** Cancel the subscription and stop polling. */
+  unsubscribe(): void;
+  /** Pause polling without unsubscribing. */
+  pause(): void;
+  /** Resume polling after pause. */
+  resume(): void;
+  /** Get the invoice ID this subscription is for. */
+  getInvoiceId(): string;
+  /** Check if subscription is active (not stopped). */
+  isActive(): boolean;
+  /** Check if subscription is paused. */
+  isPaused(): boolean;
+}
+
 /** Result of rolling over an expired invoice into a new one. */
 export interface RolloverResult {
   /** The ID of the newly created invoice. */
@@ -649,6 +1225,12 @@ export interface DisputeStatus {
   arbiter: string;
   resolved: boolean;
   resolution: "approved" | "rejected" | null;
+  /** Reason for the dispute */
+  reason?: string;
+  /** Address that opened the dispute */
+  openedBy?: string;
+  /** Unix timestamp when dispute was opened */
+  openedAt?: number;
 }
 
 /** A single auction bid. */
@@ -821,6 +1403,248 @@ export interface SetCrossChainRefParams {
 }
 
 // ---------------------------------------------------------------------------
+// Sponsorship Configuration
+// ---------------------------------------------------------------------------
+
+/** Configuration for sponsored-reserve onboarding flows. */
+export interface SponsorshipConfig {
+  /** Stellar address of the sponsoring account. */
+  sponsorAddress: string;
+  /** Stellar address of the account being onboarded / sponsored. */
+  sponsoredAddress: string;
+  /** Number of new ledger entries the sponsor will cover. */
+  entryCount: number;
+  /** Optional Horizon URL override for balance checks. */
+  horizonUrl?: string;
+}
+
+/** Result of a pre-submission sponsor reserve check. */
+export interface SponsorReserveCheckResult {
+  /** Whether the sponsor has sufficient XLM reserve. */
+  sufficient: boolean;
+  /** Sponsor's available XLM balance in stroops. */
+  availableStroops: bigint;
+  /** Required XLM reserve in stroops for the new entries. */
+  requiredStroops: bigint;
+  /** Shortfall in stroops (0 if sufficient). */
+  shortfallStroops: bigint;
+}
+
+// ---------------------------------------------------------------------------
+// Invoice Record (expanded with expiresAt for timebounds)
+// ---------------------------------------------------------------------------
+
+/**
+ * Expanded invoice record that includes the expiry timestamp
+ * used for transaction timebounds enforcement.
+ */
+export interface InvoiceRecord {
+  /** Invoice ID. */
+  invoiceId: string;
+  /** Creator address. */
+  creator: string;
+  /** Unix timestamp (seconds) when the invoice expires. */
+  expiresAt: number;
+  /** Current lifecycle status. */
+  status: InvoiceStatus;
+  /** Total amount required. */
+  totalOwed: bigint;
+  /** Unix timestamp (milliseconds) when payment is due. Used by {@link InvoiceReminderScheduler}. */
+  dueAt?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Invoice Reminder Scheduler Types
+// ---------------------------------------------------------------------------
+
+/** Lifecycle status of a single scheduled reminder. */
+export type ReminderStatus = "pending" | "fired" | "cancelled" | "expired";
+
+/** A single reminder scheduled to fire before an invoice's due date. */
+export interface ReminderSchedule {
+  /** Unique ID for this reminder entry. */
+  id: string;
+  /** Invoice this reminder is associated with. */
+  invoiceId: string;
+  /** Milliseconds before `dueAt` that this reminder should fire. */
+  offsetMs: number;
+  /** Unix timestamp (milliseconds) the invoice is due. */
+  dueAt: number;
+  /** Unix timestamp (milliseconds) this reminder is scheduled to fire (`dueAt - offsetMs`). */
+  fireAt: number;
+  /** Current lifecycle status of this reminder. */
+  status: ReminderStatus;
+}
+
+/** Payload emitted when a reminder fires. */
+export interface ReminderEvent {
+  /** Invoice the reminder is for. */
+  invoiceId: string;
+  /** Offset (ms before due date) that triggered this reminder. */
+  offsetMs: number;
+  /** Unix timestamp (milliseconds) the invoice is due. */
+  dueAt: number;
+}
+
+// ---------------------------------------------------------------------------
+// XDR Decoder Types
+// ---------------------------------------------------------------------------
+
+/** Supported XDR types for decoding. */
+export type XDRType =
+  | "TransactionEnvelope"
+  | "TransactionResult"
+  | "TransactionMeta"
+  | "LedgerEntry"
+  | "TransactionV1Envelope"
+  | "FeeBumpTransaction";
+
+/** Decoded TransactionEnvelope as a structured JSON-safe object. */
+export interface DecodedTransactionEnvelope {
+  type: "TransactionEnvelope";
+  tx: {
+    sourceAccount: string;
+    fee: string;
+    seqNum: string;
+    memo?: string;
+    operations: DecodedOperation[];
+    timeBounds?: { minTime: string; maxTime: string };
+  };
+}
+
+/** A single decoded operation within a transaction. */
+export interface DecodedOperation {
+  type: string;
+  sourceAccount?: string;
+  body: Record<string, unknown>;
+}
+
+/** A single decoded per-operation result within a DecodedTransactionResult. */
+export interface DecodedOperationResult {
+  /** OperationResultCode switch name (e.g. "opInner", "opBadAuth", "opNoAccount"). */
+  code: string;
+  /** Operation type name when `code === "opInner"` (e.g. "payment", "createClaimableBalance"). */
+  operationType?: string;
+  /** The operation-specific result code (e.g. "paymentSuccess", "paymentUnderfunded"). */
+  resultCode?: string;
+}
+
+/** Decoded TransactionResult as a structured JSON-safe object. */
+export interface DecodedTransactionResult {
+  type: "TransactionResult";
+  feeCharged: string;
+  result: {
+    code: string;
+    innerResult?: Record<string, unknown>;
+  };
+  /** Per-operation results, in the same order as the submitted transaction's operations. */
+  operationResults?: DecodedOperationResult[];
+  /** Present only for fee-bump transactions: the outer fee-bump result plus the nested inner transaction result. */
+  feeBump?: {
+    outer: { feeCharged: string; code: string };
+    inner: DecodedTransactionResult;
+  };
+}
+
+/** Decoded TransactionMeta as a structured JSON-safe object. */
+export interface DecodedTransactionMeta {
+  type: "TransactionMeta";
+  operations: Array<{
+    changes: Array<{
+      type: string;
+      key: string;
+      before?: Record<string, unknown>;
+      after?: Record<string, unknown>;
+    }>;
+  }>;
+}
+
+/** Decoded LedgerEntry as a structured JSON-safe object. */
+export interface DecodedLedgerEntry {
+  type: "LedgerEntry";
+  lastModifiedLedgerSeq: number;
+  data: {
+    type: string;
+    accountId?: string;
+    balance?: string;
+    flags?: number;
+    signers?: Array<{ key: string; weight: number }>;
+    thresholds?: { low: number; med: number; high: number };
+    [key: string]: unknown;
+  };
+}
+
+/** Decoded AUTH_* flags for a Stellar account, with operation-compatibility checks. */
+export interface AccountFlagSet {
+  /** AUTH_REQUIRED — the issuer must approve an account before it can hold this asset. */
+  authRequired: boolean;
+  /** AUTH_REVOCABLE — the issuer can revoke an account's authorization to hold this asset. */
+  authRevocable: boolean;
+  /** AUTH_IMMUTABLE — this account's flags can never be changed again. */
+  authImmutable: boolean;
+  /** AUTH_CLAWBACK_ENABLED — the issuer can claw back this asset from holders. */
+  authClawbackEnabled: boolean;
+  /** Returns `false` when this account's flags make `operation` impossible without prior authorization. */
+  isCompatibleWith(operation: string): boolean;
+}
+
+/** Declarative description of a claimable-balance claim predicate, buildable via `PredicateBuilder.build()`. */
+export type PredicateConfig =
+  | { type: "unconditional" }
+  | { type: "absoluteWindow"; start: number; end: number }
+  | { type: "relativeWindow"; secondsFromNow: number }
+  | { type: "and"; predicates: [PredicateConfig, PredicateConfig] }
+  | { type: "or"; predicates: [PredicateConfig, PredicateConfig] };
+
+/** Union type of all decoded XDR variants. */
+export type DecodedXDR =
+  | DecodedTransactionEnvelope
+  | DecodedTransactionResult
+  | DecodedTransactionMeta
+  | DecodedLedgerEntry;
+
+// ---------------------------------------------------------------------------
+// Confidential Payment Types (Pedersen Commitments)
+// ---------------------------------------------------------------------------
+
+/** Result of generating a Pedersen commitment for a payment amount. */
+export interface PedersenCommitment {
+  /** The commitment point C = aH + vG, serialized as 33-byte compressed point. */
+  commitment: Buffer;
+  /** The random blinding factor 'a' used in the commitment (32 bytes). */
+  blindingFactor: Buffer;
+}
+
+/** Configuration for blinding factor storage. */
+export interface BlindingFactorStorageConfig {
+  /** Storage key prefix. Defaults to "stellarsplit:bf:". */
+  keyPrefix?: string;
+}
+
+/** Stored blinding factor entry with metadata. */
+export interface StoredBlindingFactor {
+  /** The encrypted blinding factor. */
+  encryptedData: Uint8Array;
+  /** AES-GCM initialization vector (12 bytes). */
+  iv: Uint8Array;
+  /** Invoice ID this blinding factor belongs to. */
+  invoiceId: string;
+  /** Unix timestamp when stored. */
+  storedAt: number;
+}
+
+/** Options for building a reveal payment transaction. */
+export interface RevealPaymentOptions {
+  /** Invoice ID to reveal payment for. */
+  invoiceId: bigint;
+  /** The actual payment value that was committed. */
+  value: bigint;
+  /** The blinding factor used in the original commitment. */
+  blindingFactor: Buffer;
+  /** Payer's Stellar address. */
+  payer: string;
+}
+
 // IPFS Invoice Metadata Types
 // ---------------------------------------------------------------------------
 
@@ -848,6 +1672,72 @@ export interface InvoiceMetadata {
   attachmentCIDs: string[];
 }
 
+// ---------------------------------------------------------------------------
+// Multi-Asset Line Item Normalizer Types
+// ---------------------------------------------------------------------------
+
+/** A line item denominated in its own asset, prior to settlement normalisation. */
+export interface InvoiceLineItem {
+  /** Description of the item or service. */
+  description: string;
+  /** Quantity of items. */
+  quantity: number;
+  /** Unit price in stroops, denominated in `asset`. */
+  unitPrice: bigint;
+  /** Optional total override (defaults to quantity * unitPrice), denominated in `asset`. */
+  total?: bigint;
+  /** Asset identifier this line item is priced in: "native" or "CODE:ISSUER" or a contract address. */
+  asset: string;
+}
+
+/** A line item after conversion to the invoice's settlement asset. */
+export interface NormalizedLineItem {
+  /** Description of the item or service. */
+  description: string;
+  /** Original amount in stroops, denominated in `originalAsset`. */
+  originalAmount: bigint;
+  /** Asset identifier the line item was originally denominated in. */
+  originalAsset: string;
+  /** Amount in stroops after conversion to the settlement asset. */
+  convertedAmount: bigint;
+  /** Fixed-point rate (1e18 = 1.0) used for the conversion; 1e18 when no conversion was needed. */
+  conversionRate: bigint;
+}
+
+/** Aggregate result of normalising an invoice's line items to a single settlement asset. */
+export interface NormalizedInvoiceTotal {
+  /** Asset identifier all amounts were normalised to. */
+  settlementAsset: string;
+  /** Sum of all `convertedAmount` values, in stroops. */
+  total: bigint;
+  /** Per-item normalised amounts, in the same order as the input. */
+  items: NormalizedLineItem[];
+}
+
+// ---------------------------------------------------------------------------
+// Contract Retry Queue Types
+// ---------------------------------------------------------------------------
+
+/** A single Soroban contract invocation to be submitted (with retry on failure). */
+export interface ContractInvocation {
+  /** Contract address being invoked. */
+  contractId: string;
+  /** Contract method name. */
+  method: string;
+  /** Method arguments, in the order the contract expects them. */
+  args: unknown[];
+  /** Stellar address the invocation is submitted on behalf of. */
+  source: string;
+}
+
+/** Result of a successfully submitted contract invocation. */
+export interface ContractResult {
+  /** Hash of the submitted transaction. */
+  txHash: string;
+  /** Decoded return value from the contract call, if any. */
+  returnValue?: unknown;
+}
+
 /** Configuration for IPFS backend. */
 export interface IPFSConfig {
   /** Backend type: 'gateway' for HTTP gateway or 'kubo' for Kubo RPC API. */
@@ -870,4 +1760,519 @@ export interface CIDVerificationResult {
   computedCID?: string;
   /** Error message if verification failed. */
   error?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-Chain Bridge Payment Types
+// ---------------------------------------------------------------------------
+
+/**
+ * Supported source chain identifiers for cross-chain bridge payments.
+ * Ethereum mainnet and Solana mainnet are the minimum required chains.
+ */
+export type ChainId = "ethereum" | "solana";
+
+/**
+ * Fee estimate returned by the bridge for routing a payment from a foreign chain
+ * to a StellarSplit invoice on Stellar Soroban.
+ */
+export interface BridgeFeeEstimate {
+  /** Bridge relay fee in source-chain native units (e.g. wei for ETH, lamports for SOL). */
+  bridgeFee: bigint;
+  /** Net amount that will arrive on Stellar after fee deduction, in stroops. */
+  netAmount: bigint;
+  /** Estimated bridging time in seconds. */
+  estimatedTimeSeconds: number;
+}
+
+/**
+ * Parameters required to build an unsigned bridge payment relay proof struct.
+ */
+export interface BridgePaymentParams {
+  /** Source chain identifier. */
+  sourceChain: ChainId;
+  /** Stellar address of the payer (used as the Stellar recipient identity). */
+  payer: string;
+  /** StellarSplit invoice ID to pay toward. */
+  invoiceId: string;
+  /** Amount to send from the source chain (in source-chain atomic units). */
+  amount: bigint;
+  /** Token contract/mint address on the source chain. */
+  sourceToken: string;
+  /** Deadline timestamp (Unix seconds) for this bridge payment. */
+  deadline: number;
+}
+
+/**
+ * Unsigned relay proof struct built by buildBridgePayment.
+ * This must be signed by the payer's source-chain wallet before submission.
+ */
+export interface BridgePaymentRequest {
+  /** Source chain identifier. */
+  sourceChain: ChainId;
+  /** Stellar invoice ID. */
+  invoiceId: string;
+  /** Stellar payer address. */
+  payer: string;
+  /** Amount in source-chain atomic units. */
+  amount: bigint;
+  /** Source-chain token identifier. */
+  sourceToken: string;
+  /** Deadline for the bridge payment (Unix seconds). */
+  deadline: number;
+  /** Unique nonce preventing replay attacks. */
+  nonce: string;
+  /** SHA-256 hex digest of the canonical relay payload. */
+  payloadHash: string;
+}
+
+/**
+ * A bridge payment request that has been signed by the source-chain wallet.
+ * Passed to submitBridgePayment to relay to the Stellar contract.
+ */
+export interface SignedBridgeProof {
+  /** The original unsigned payment request. */
+  request: BridgePaymentRequest;
+  /** Source-chain signature over the payloadHash (hex-encoded). */
+  signature: string;
+  /** Source-chain address of the signer. */
+  signerAddress: string;
+}
+
+// ---------------------------------------------------------------------------
+// Memo Builder Types
+// ---------------------------------------------------------------------------
+
+/**
+ * Configuration for the split memo builder, defining the version of the split
+ * protocol used when encoding memo data.
+ */
+export interface SplitConfig {
+  /** Protocol version number for the split memo format. */
+  version: number;
+}
+
+/**
+ * Parsed representation of a canonical StellarSplit memo.
+ */
+export interface ParsedMemo {
+  /** The invoice ID extracted from the memo. */
+  invoiceId: string;
+  /** The split protocol version encoded in the memo. */
+  version: number;
+  /** The payer's Stellar address suffix (last 8 chars) used for identification. */
+  payerId: string;
+}
+
+// ---------------------------------------------------------------------------
+// Asset Issuer Verification Types
+// ---------------------------------------------------------------------------
+
+/** Result of verifying an asset issuer's on-chain identity and metadata. */
+export interface IssuerVerificationResult {
+  /** Whether the issuer passed all verification checks. */
+  verified: boolean;
+  /** The issuer account ID that was checked. */
+  issuerId: string;
+  /** Whether the issuer account exists on the network. */
+  accountExists: boolean;
+  /** The home domain claimed by the issuer account, if any. */
+  homeDomain: string | null;
+  /** Whether a valid stellar.toml was found at the home domain. */
+  tomlFound: boolean;
+  /** Whether the asset code was listed in the CURRENCIES section of the toml. */
+  assetInToml: boolean;
+  /** The asset code that was verified against the toml. */
+  assetCode: string | null;
+  /** List of human-readable failure reasons when verified is false. */
+  errors: string[];
+}
+
+// ---------------------------------------------------------------------------
+// SEP-24 Interactive Transfer Types
+// ---------------------------------------------------------------------------
+
+/** Lifecycle status of a SEP-24 interactive transfer. */
+export type Sep24Status =
+  | "incomplete"
+  | "pending_user_transfer_start"
+  | "pending_anchor"
+  | "pending_stellar"
+  | "pending_external"
+  | "completed"
+  | "error"
+  | "refunded";
+
+/** A record tracking a single SEP-24 interactive deposit or withdrawal. */
+export interface Sep24TransactionRecord {
+  /** SEP-24 transaction ID returned by the anchor. */
+  id: string;
+  /** Type of transfer: deposit or withdrawal. */
+  kind: "deposit" | "withdrawal";
+  /** Current lifecycle status. */
+  status: Sep24Status;
+  /** Amount requested in the transfer (in stroops). */
+  amount: bigint;
+  /** Asset code (e.g., "USDC"). */
+  assetCode: string;
+  /** The anchor's Stellar address for the asset issuer. */
+  assetIssuer: string;
+  /** The interactive IFRAME URL the user should visit. */
+  interactiveUrl: string | null;
+  /** Stellar transaction ID once the transfer completes on-chain. */
+  stellarTxId: string | null;
+  /** Unix timestamp when the transaction was initiated. */
+  startedAt: number;
+  /** Unix timestamp of the last status update. */
+  updatedAt: number;
+  /** Anchor service endpoint used for this transfer. */
+  anchorUrl: string;
+  /** Optional KYC/verification URL if required by the anchor. */
+  kycUrl: string | null;
+  /** Optional human-readable error message when status is "error". */
+  errorMessage: string | null;
+}
+
+/** Event emitted when a SEP-24 transaction status changes. */
+export interface Sep24StatusChangedEvent {
+  /** The transaction record with updated status. */
+  transaction: Sep24TransactionRecord;
+  /** The previous status before this change. */
+  previousStatus: Sep24Status;
+}
+
+// ---------------------------------------------------------------------------
+// Auth-Required Trustline Handler Types
+// ---------------------------------------------------------------------------
+
+/** Lifecycle status of an auth-required trustline approval. */
+export type TrustlineAuthStatus = "required" | "not_required" | "granted";
+
+/** Stellar operation used to grant trustline authorization. */
+export type TrustlineAuthOperationType = "setTrustLineFlags" | "allowTrust";
+
+/** A request to authorize a recipient's trustline for an AUTH_REQUIRED asset. */
+export interface TrustlineAuthRequest {
+  /** Stellar address of the recipient whose trustline needs authorization. */
+  recipientId: string;
+  /** Asset code (e.g. "USDC"). */
+  assetCode: string;
+  /** Asset issuer's Stellar address. */
+  assetIssuer: string;
+  /** Whether the issuer account has the AUTH_REQUIRED flag set. */
+  authRequired: boolean;
+  /** Current status of this authorization request. */
+  status: TrustlineAuthStatus;
+  /** Unix timestamp (milliseconds) this request/grant was recorded. */
+  requestedAt: number;
+  /** Operation type used to grant authorization, set once `status` is "granted". */
+  operationType?: TrustlineAuthOperationType;
+  /** Submission transaction hash, set once `status` is "granted". */
+  txHash?: string;
+}
+
+// ---------------------------------------------------------------------------
+// SEP-31 Cross-Border Direct Payment Types
+// ---------------------------------------------------------------------------
+
+/** Lifecycle status of a SEP-31 direct payment, per the SEP-31 spec. */
+export type Sep31Status =
+  | "pending_sender"
+  | "pending_receiver"
+  | "pending_transaction_info_update"
+  | "pending_stellar"
+  | "pending_external"
+  | "completed"
+  | "error";
+
+/** Description of a single field required by the receiving anchor's /send endpoint. */
+export interface Sep31FieldSpec {
+  /** Human-readable description of the field. */
+  description: string;
+  /** Allowed values, when the field is an enum. */
+  choices?: string[];
+  /** Whether the field may be omitted. */
+  optional?: boolean;
+}
+
+/** Typed field schema returned by the receiving anchor's /info endpoint for one asset. */
+export interface Sep31RequiredFields {
+  /** Minimum payment amount the anchor will accept, if published. */
+  minAmount?: number;
+  /** Maximum payment amount the anchor will accept, if published. */
+  maxAmount?: number;
+  /** Additional transaction-level fields the anchor requires (e.g. routing_number). */
+  transactionFields: Record<string, Sep31FieldSpec>;
+}
+
+/** A record tracking a single SEP-31 cross-border direct payment. */
+export interface Sep31PaymentRecord {
+  /** Transaction ID returned by the receiving anchor. */
+  id: string;
+  /** Current lifecycle status. */
+  status: Sep31Status;
+  /** Asset code (e.g. "USDC"). */
+  assetCode: string;
+  /** Asset issuer's Stellar address. */
+  assetIssuer: string;
+  /** Payment amount as a decimal string. */
+  amount: string;
+  /** Home domain of the receiving anchor. */
+  anchorDomain: string;
+  /** Stellar transaction ID once the payment settles on-chain. */
+  stellarTxId: string | null;
+  /** Unix timestamp (milliseconds) the payment was initiated. */
+  startedAt: number;
+  /** Unix timestamp (milliseconds) of the last status update. */
+  updatedAt: number;
+  /** Anchor-supplied message describing what additional info is needed, if any. */
+  requiredInfoMessage: string | null;
+  /** Human-readable error message when status is "error". */
+  errorMessage: string | null;
+}
+
+/** Event emitted when a SEP-31 payment's status changes. */
+export interface Sep31StatusChangedEvent {
+  /** The payment record with updated status. */
+  payment: Sep31PaymentRecord;
+  /** The previous status before this change, or null for the initial creation. */
+  previousStatus: Sep31Status | null;
+}
+
+// ---------------------------------------------------------------------------
+// Horizon Paginator Types
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal interface for a Horizon collection page that supports
+ * cursor-based pagination via a .next() method.
+ */
+export interface CollectionPage<T> {
+  /** Records in the current page. */
+  records: T[];
+  /** Fetch the next page, or return null when exhausted. */
+  next(): Promise<CollectionPage<T> | null>;
+}
+
+/** Configuration options for the horizon paginator. */
+export interface HorizonPaginatorOptions {
+  /** Maximum number of records to yield across all pages. Default: unlimited. */
+  maxRecords?: number;
+  /**
+   * The page size that was passed to the Horizon call builder's `.limit()`
+   * method. The paginator uses this to detect when the server has silently
+   * capped the page size and adapts `effectivePageSize` accordingly.
+   * Default: 200.
+   */
+  pageSize?: number;
+  /** Optional cursor store for persisting the last-seen paging token. */
+  cursorStore?: CursorStore;
+  /** Optional namespace for cursor storage keys (default: "horizon"). */
+  cursorNamespace?: string;
+}
+
+/** Persistence interface for cursor tracking. */
+export interface CursorStore {
+  /** Save a cursor value under a named key. */
+  save(key: string, cursor: string): Promise<void>;
+  /** Load a previously saved cursor value, or null if not found. */
+  load(key: string): Promise<string | null>;
+  /** Delete a saved cursor. */
+  delete(key: string): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Account Data Entry Types (Issue #528)
+// ---------------------------------------------------------------------------
+
+/** A single decoded key-value data entry stored on a Stellar account. */
+export interface AccountDataEntry {
+  /** Data entry key (max 64 bytes). */
+  key: string;
+  /** Decoded (UTF-8) value, or null when the entry has been cleared. */
+  value: string | null;
+}
+
+/** All data entries currently stored on an account, keyed by entry name. */
+export type AccountDataMap = Record<string, string>;
+
+// ---------------------------------------------------------------------------
+// Soroban Feature Detection Types (Issue #529)
+// ---------------------------------------------------------------------------
+
+/**
+ * Typed flags for protocol-version-gated Soroban features, plus the raw
+ * resource limits pulled from the network's `ConfigSettingEntry` ledger
+ * entries.
+ */
+export interface SorobanFeatureFlags {
+  /** Current Stellar protocol version integer. */
+  protocolVersion: number;
+  /** Whether the network supports the `ExtendFootprintTtl` operation (protocol >= 20). */
+  supportsExtendFootprint: boolean;
+  /** Whether the network supports archived-entry restoration (protocol >= 20). */
+  supportsRestoreFootprint: boolean;
+  /** Maximum Soroban instructions allowed per transaction. */
+  maxInstructionsPerTx: number;
+  /** Maximum Soroban instructions allowed per ledger. */
+  maxInstructionsPerLedger: number;
+  /** Unix timestamp (ms) when these flags were detected. */
+  detectedAt: number;
+}
+
+// ---------------------------------------------------------------------------
+// Per-Split Audit Log Types (Issue #531)
+// ---------------------------------------------------------------------------
+
+/** A granular audit record for a single settled leg of a multi-recipient split payment. */
+export interface SplitAuditEntry {
+  /** Invoice the split payment belongs to. */
+  invoiceId: string;
+  /** Zero-based index of this leg within the split. */
+  legIndex: number;
+  /** Stellar address of the recipient for this leg. */
+  recipientId: string;
+  /** Asset code paid out for this leg. */
+  assetCode: string;
+  /** Amount paid to this recipient, in stroops. */
+  amount: bigint;
+  /** Operation ID of the settlement operation. */
+  operationId: string;
+  /** Ledger sequence number at which the leg settled. */
+  ledgerSequence: number;
+  /** Unix timestamp (seconds) when the leg settled. */
+  settledAt: number;
+}
+
+// ---------------------------------------------------------------------------
+// Subentry Capacity Guard Types (Issue #591)
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of a subentry capacity check for a Stellar account.
+ *
+ * Derived from live Horizon account data using the protocol reserve formula:
+ *   (2 + numSubentries + numSponsoring − numSponsored) × baseReserve
+ */
+export interface SubentryCapacityResult {
+  /** Number of subentry slots currently consumed by the account. */
+  used: number;
+  /** Number of subentry slots available for new entries. */
+  available: number;
+  /**
+   * Protocol maximum for subentries derived from the account's free XLM
+   * balance (i.e., how many more subentries the balance can support beyond
+   * the base reserve).
+   */
+  limit: number;
+  /** Whether the account can accommodate the requested number of additional slots. */
+  canAccommodate: boolean;
+}
+
+/**
+ * Describes a subentry capacity shortfall.
+ *
+ * Thrown by splitExecutor when an account cannot accommodate new subentries
+ * (trustlines, data entries, signers, offers) due to insufficient XLM reserve.
+ */
+export interface SubentryCapacityError {
+  /** Stellar address of the account that lacks capacity. */
+  accountId: string;
+  /** Number of additional XLM (in stroops) required to satisfy the reserve. */
+  additionalReserveNeededStroops: bigint;
+  /** Number of additional XLM (as decimal string, e.g. "1.5000000") required. */
+  additionalReserveNeededXlm: string;
+  /** The capacity result that triggered this error. */
+  capacityResult: SubentryCapacityResult;
+}
+
+// ---------------------------------------------------------------------------
+// Claimable Balance Lifecycle Types
+// ---------------------------------------------------------------------------
+
+/** Lifecycle status of a tracked claimable balance. */
+export type ClaimableBalanceStatus = "created" | "claimed" | "expired";
+
+/** A claimable balance record tracked by {@link ClaimableBalanceLifecycle}. */
+export interface ClaimableBalanceRecord {
+  /** Stellar claimable balance ID (e.g. `00000000…`). */
+  balanceId: string;
+  /** Stellar address of the account that can claim this balance. */
+  claimant: string;
+  /** Asset descriptor: `"native"` for XLM, `"CODE:ISSUER"` for issued assets. */
+  asset: string;
+  /** Human-readable amount string (e.g. `"12.5000000"`). */
+  amount: string;
+  /** Current lifecycle status. */
+  status: ClaimableBalanceStatus;
+  /** Unix epoch ms when the balance was created / first tracked. */
+  createdAt: number;
+  /** Unix epoch ms when the balance was claimed, or `null` if not yet claimed. */
+  claimedAt: number | null;
+  /** Ledger sequence after which the predicate expires (optional). */
+  predicateExpiryLedger?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Invoice Rating Types (Issue #865)
+// ---------------------------------------------------------------------------
+
+/** Creator rating information. */
+export interface CreatorRating {
+  /** Total number of ratings received by the creator. */
+  totalRatings: bigint;
+  /** Average star rating as a float (e.g. 4.3). */
+  averageStars: number;
+}
+
+// ---------------------------------------------------------------------------
+// Deadline Extension Types (Issue #864)
+// ---------------------------------------------------------------------------
+
+/** Extension status for an invoice deadline. */
+export interface ExtensionStatus {
+  /** Current number of votes for extension. */
+  voteCount: bigint;
+  /** Minimum number of votes required (quorum). */
+  quorumRequired: bigint;
+  /** Number of times the deadline has been extended. */
+  extensionCount: bigint;
+  /** Maximum allowed extensions. */
+  maxExtensions: bigint;
+  /** Current deadline timestamp. */
+  currentDeadline: bigint;
+}
+
+// ---------------------------------------------------------------------------
+// Group Management Types (Issue #863)
+// ---------------------------------------------------------------------------
+
+/** Statistics for an invoice group. */
+export interface GroupStats {
+  /** Group name. */
+  name: string;
+  /** Total target amount for all invoices in the group. */
+  totalTarget: bigint;
+  /** Total funded amount for all invoices in the group. */
+  totalFunded: bigint;
+  /** Number of invoices in the group. */
+  invoiceCount: bigint;
+  /** Number of fully funded invoices in the group. */
+  fullyFundedCount: bigint;
+}
+
+// ---------------------------------------------------------------------------
+// Attestation Types (Issue #862)
+// ---------------------------------------------------------------------------
+
+/** Invoice attestation record. */
+export interface Attestation {
+  /** Address of the attester. */
+  attester: string;
+  /** Attestation statement (max 256 chars). */
+  statement: string;
+  /** Unix timestamp when the attestation was created. */
+  timestamp: bigint;
+  /** Whether the attestation has been revoked. */
+  revoked: boolean;
 }

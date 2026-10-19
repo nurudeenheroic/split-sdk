@@ -15,7 +15,44 @@ import {
   scValToNative,
   xdr,
   Keypair,
+  StrKey,
 } from "@stellar/stellar-sdk";
+import { TypedEventEmitter } from "./events/TypedEventEmitter.js";
+import type { Signer } from "./signing/signer.js";
+import type { CircuitStateChangeLogEvent } from "./resilience/CircuitBreaker.js";
+import { InvoiceStateMachine } from "./state/InvoiceStateMachine.js";
+import type { StateMachineConfig } from "./types/state.js";
+import { RpcLoadBalancer } from "./rpc/RpcLoadBalancer.js";
+import { OfflineQueue, type QueuedOperation } from "./offlineQueue.js";
+import type { EndpointConfig, RpcLoadBalancerOptions } from "./rpc/RpcLoadBalancer.js";
+
+/** Events emitted by {@link StellarSplitClient}. */
+export type SplitClientEventMap = {
+  /** The advanced circuit breaker (src/resilience/CircuitBreaker.ts) tripped open. */
+  "circuit:open": undefined;
+  /** The advanced circuit breaker closed after a successful probe. */
+  "circuit:close": undefined;
+  /** The advanced circuit breaker entered half-open (probing) state. */
+  "circuit:half-open": undefined;
+  /** Fired on every advanced circuit breaker state transition. */
+  circuit_state_change: CircuitStateChangeLogEvent;
+  /** An RpcLoadBalancer endpoint (from `rpcEndpoints`) was quarantined. */
+  "endpoint:demoted": { url: string; reason: "consecutive_errors" | "failed_health_check" };
+  /** A previously quarantined RpcLoadBalancer endpoint passed its health check and rejoined rotation. */
+  "endpoint:reinstated": { url: string };
+  /** Emitted when a batch of invoices is successfully created. */
+  "batch:created": { invoiceIds: bigint[] };
+  /** Emitted when a payment is made to an invoice. */
+  payment: import("./contractEvents.js").PaymentEvent;
+  /** Emitted when funds are released from an invoice. */
+  release: import("./contractEvents.js").ReleaseEvent;
+  /** Emitted when an invoice is refunded. */
+  refund: import("./contractEvents.js").RefundEvent;
+  /** Emitted when a dispute is opened on an invoice. */
+  dispute: import("./contractEvents.js").DisputeEvent;
+  /** Emitted when a tier is unlocked on an invoice. */
+  tier_unlocked: import("./contractEvents.js").TierUnlockedEvent;
+};
 import { signTransaction } from "./wallet.js";
 import { telemetry } from "./telemetry.js";
 import { TelemetryHookManager } from "./telemetryHooks.js";
@@ -33,6 +70,8 @@ import { PluginRegistry } from "./plugin.js";
 import type { SdkPlugin } from "./plugin.js";
 import { checkRPCHealth } from "./health.js";
 import { Deduplicator } from "./dedup.js";
+import { SorobanFeatureDetector } from "./sorobanFeatureDetector.js";
+import type { SorobanFeatureFlags } from "./types.js";
 import { verifyBatchPayments } from "./batchVerifier.js";
 import { type HealthCheckResult, HealthCheckTimeoutError } from "./types.js";
 import type {
@@ -53,8 +92,36 @@ import {
 } from "./compression.js";
 import type { CompressionConfig } from "./compression.js";
 import { calculateFee } from "./fee.js";
+import { isValidStellarAddress as isValidAddress } from "./utils.js";
 import { resolveToken } from "./token.js";
+import { generatePaymentReceipt } from "./receipt.js";
 import type { PaymentReceipt } from "./receipt.js";
+import { checkInvoiceExpiry, checkPayerReadiness } from "./preflightChecker.js";
+import { InvoiceCloneabilityValidator } from "./preflight/InvoiceCloneabilityValidator.js";
+import { InvoiceQueryEngine } from "./invoiceQuery.js";
+import type { InvoiceFilter, InvoicePage } from "./invoiceQuery.js";
+
+import { createInvoiceSubscription } from "./subscription.js";
+import type { Subscription, InvoiceEvent, SubscriptionOptions, SimulationResult, LedgerFootprint } from "./types.js";
+import { getSubscriptionManager } from "./streaming/SubscriptionManager.js";
+import { destroySubscriptionManager } from "./streaming/SubscriptionManager.js";
+import type { SubscriptionOptions as SubscriptionManagerOptions } from "./types/events.js";
+import { CircuitBreaker as AdvancedCircuitBreaker } from "./resilience/CircuitBreaker.js";
+import type {
+  CircuitBreakerOptions as AdvancedCircuitBreakerOptions,
+  CircuitBreakerStateSnapshot,
+} from "./resilience/CircuitBreaker.js";
+import type { WaterfallPlan } from "./types/routing.js";
+import {
+  WaterfallInsufficientFundsError,
+  InvalidAttestationError,
+  AlreadyRatedError,
+  InvoiceNotReleasedForRatingError,
+  NotEligibleToVoteError,
+} from "./errors.js";
+import { OptimisticCache } from "./cache/OptimisticCache.js";
+import type { CommitFn, RollbackFn } from "./cache/OptimisticCache.js";
+import { getOptimisticInvoice } from "./optimistic.js";
 import type {
   ArchivedInvoice,
 
@@ -77,6 +144,7 @@ import type {
   InvoiceEventCallbacks,
   InvoiceExt,
   InvoiceGroup,
+  InvoiceParamOverrides,
   InvoiceReceipt,
   InvoiceStatus,
   PaginatedResult,
@@ -108,7 +176,22 @@ import type {
   CompletionProof,
   AdminFreezeResult,
   AdminUnfreezeResult,
+  ChainId,
+  BridgeFeeEstimate,
+  BridgePaymentParams,
+  BridgePaymentRequest,
+  SignedBridgeProof,
+  Attestation,
+  CreatorRating,
+  ExtensionStatus,
+  GroupStats,
 } from "./types.js";
+import {
+  estimateBridgeFee as _estimateBridgeFee,
+  buildBridgePayment as _buildBridgePayment,
+  submitBridgePayment as _submitBridgePayment,
+} from "./bridge.js";
+import type { BridgeConfig } from "./bridge.js";
 import type {
   DIContainer,
   IRPCClient,
@@ -140,12 +223,24 @@ import {
   RpcUnavailableError,
   UnknownEndpointError,
   QueueFailedError,
+  ShutdownInProgressError,
   SignerFailedError,
   NoSignerProvidedError,
   ValidationError,
   StellarSplitError,
   AdminOperationError,
+  PassphraseMismatchError,
+  NetworkMismatchError,
+  InvoiceIntegrityError,
+  InvoiceNotCloneableError,
+  InvalidTransactionTypeError,
+  RoundNotEndedError,
+  WrongMilestoneError,
+  NothingToClaimError,
 } from "./errors.js";
+import { hashInvoice, verifyInvoiceHash } from "./invoiceHashVerifier.js";
+import { buildFeeBump } from "./feeBumpBuilder.js";
+import type { FeeBumpConfig } from "./feeBumpBuilder.js";
 import { replayEvents } from "./events.js";
 import { subscribeToInvoice as _subscribeToInvoice } from "./stream.js";
 import { subscribeToInvoice as _subscribeToInvoiceSSE } from "./sse.js";
@@ -176,7 +271,15 @@ import { PriorityQueue } from "./priorityQueue.js";
 import type { RequestPriority } from "./priorityQueue.js";
 import { IdempotencyManager } from "./idempotency.js";
 import type { IdempotencyConfig } from "./idempotency.js";
+import { RollbackCoordinator } from "./splitRollbackCoordinator.js";
 import { validateInvoicePayload } from "./payloadGuard.js";
+import { InvoiceMetadataValidator } from "./validators/invoiceMetadataValidator.js";
+import { validateSplitRatiosOrThrow } from "./validators/splitRatioValidator.js";
+import type { SplitConfig } from "./types.js";
+import { checkTrustlines } from "./trustlineChecker.js";
+import type { TrustlineCheckResult } from "./trustlineChecker.js";
+import { parseEnvelope } from "./xdrParser.js";
+import type { ParsedEnvelope } from "./xdrParser.js";
 import type { PayloadGuardConfig } from "./payloadGuard.js";
 import { HorizonFallbackReader } from "./horizonFallback.js";
 import type {
@@ -196,11 +299,26 @@ import type {
 import { Asset } from "@stellar/stellar-sdk";
 import { rolloverInvoice as _rolloverInvoice } from "./invoiceRollover.js";
 import { BatchedRpcClient } from "./requestBatcher.js";
-import { TimeoutManager, withTimeout } from "./timeout.js";
+import { TimeoutManager, withTimeoutOrThrow } from "./timeout.js";
 import type { TimeoutConfig } from "./timeout.js";
 import { RequestTimeoutError } from "./errors.js";
 import { TraceIdManager } from "./traceId.js";
 import type { RpcClient } from "./rpcClient.js";
+import { ResilientRpcClient } from "./resilientRpc.js";
+import type {
+  RetryConfig as ResilientRetryConfig,
+  CircuitBreakerConfig,
+} from "./resilientRpc.js";
+import { NetworkPassphraseValidator } from "./network/NetworkPassphraseValidator.js";
+import {
+  NetworkEnvironment,
+  getNetworkPreset,
+  isNetworkPreset,
+  detectNetworkEnvironment,
+} from "./config.js";
+import type { NetworkPreset } from "./config.js";
+import type { OtelHandle, TelemetryOptions } from "./telemetry/OtelExporter.js";
+import { createOtelHandle, noopOtelHandle, OtelExporter } from "./telemetry/OtelExporter.js";
 
 /** A plugin that extends StellarSplitClient with new methods and lifecycle hooks. */
 export interface StellarSplitPlugin {
@@ -230,6 +348,10 @@ export interface StellarSplitClientConfig {
   networkPassphrase: string;
   /** Deployed StellarSplit contract ID. */
   contractId: string;
+  /** Whether to validate the passphrase against the RPC node on startup. Defaults to true. */
+  validatePassphrase?: boolean;
+  /** Map of available networks for the live switcher. */
+  networks?: Record<string, NetworkConfig>;
   /** Maximum retry attempts for transient pay() failures. Defaults to 3. */
   maxRetries?: number;
   /** Optional telemetry configuration. */
@@ -245,14 +367,22 @@ export interface StellarSplitClientConfig {
   cache?: { enabled?: boolean; ttl?: Record<string, number>; ttlMs?: number };
   /** Optional signing keypair for request signing. */
   signingKeypair?: Keypair;
+  /**
+   * Optional pluggable signing vault adapter (issue #589). When provided,
+   * transaction signing can be delegated to a hardware security module,
+   * cloud KMS, or encrypted keystore through the narrow {@link Signer}
+   * contract instead of an in-memory {@link Keypair}. Exposed at runtime via
+   * `client.signer`.
+   */
+  signer?: Signer;
   /** Optional compliance rules injectable for invoice checks. */
   complianceRules?: import("./compliance.js").ComplianceRule[];
   /** Optional dependency injection container for RPC, cache, and wallet implementations. */
   container?: DIContainer;
+  /** Optional lifecycle hooks for invoice events. */
+  hooks?: import("./types.js").InvoiceLifecycleHooks;
   /** Optional request/response compression middleware. Disabled by default. */
   compression?: CompressionConfig;
-  /** Optional invoice lifecycle hooks. */
-  hooks?: InvoiceLifecycleHooks;
   /** Optional retry configuration. Enables automatic retry with exponential backoff and jitter. */
   retry?: RetryOptions;
   /**
@@ -354,6 +484,73 @@ export interface StellarSplitClientConfig {
    * passed to each admin method, so callers cannot forge an admin identity.
    */
   adminKeypair?: Keypair;
+  /**
+   * Optional circuit breaker configuration for RPC call resilience.
+   * When provided, a circuit breaker is created that tracks consecutive
+   * RPC failures and temporarily blocks calls when the failure threshold
+   * is exceeded, auto-resetting after a cooldown period.
+   * Retry configuration for the circuit breaker's internal retry layer.
+   * Applied to every RPC call wrapped by the circuit breaker.
+   */
+  circuitBreaker?: {
+    /** Circuit breaker settings (failure threshold, reset timeout). */
+    breaker?: Partial<CircuitBreakerConfig>;
+    /** Retry settings applied per RPC call (maxRetries, baseDelayMs, etc.). */
+    retry?: Partial<ResilientRetryConfig>;
+  };
+  offlineQueue?: import("./offlineQueue.js").OfflineQueueConfig;
+  /**
+   * Optional configuration for the CLOSED/OPEN/HALF_OPEN circuit breaker
+   * (src/resilience/CircuitBreaker.ts) guarding the transaction-submission
+   * path. When OPEN, `pay()` and other write methods fail fast with
+   * CircuitOpenError instead of hanging until RPC timeout. Exposed at
+   * runtime via `client.circuitBreaker.getState()`.
+   */
+  advancedCircuitBreaker?: Partial<AdvancedCircuitBreakerOptions>;
+  /**
+   * When true, `pay()` applies a predicted Invoice update immediately on
+   * submission and `getInvoice()` returns it until the transaction settles,
+   * instead of returning stale data while the transaction is pending.
+   */
+  optimisticCache?: boolean;
+  /** Whether to validate the passphrase against the RPC node on startup. Defaults to true. */
+  validatePassphrase?: boolean;
+  /** Map of available networks for the live switcher. */
+  networks?: Record<string, NetworkConfig>;
+  /**
+   * Optional override for the allowed invoice status transition graph used
+   * by InvoiceStateMachine. When omitted, the default graph is used
+   * (Pending -> Released | Refunded | Cancelled; the rest are terminal).
+   */
+  stateMachine?: StateMachineConfig;
+  /**
+   * Optional list of Soroban RPC endpoints to distribute calls across via
+   * health-weighted round-robin ({@link RpcLoadBalancer}). When provided,
+   * this takes priority over `rpcUrl` for selecting the primary server;
+   * endpoints that error repeatedly or exceed their latency budget are
+   * quarantined and automatically reinstated after a passing health check.
+   * When omitted, the existing single/array `rpcUrl` behavior is unchanged.
+   */
+  rpcEndpoints?: EndpointConfig[];
+  /** Optional tuning for the {@link RpcLoadBalancer} created from `rpcEndpoints`. */
+  rpcLoadBalancer?: RpcLoadBalancerOptions;
+  /**
+   * Optional fee surge detector configuration for surge-aware fee adjustment.
+   * When enabled, fees are adjusted dynamically during network congestion
+   * based on live Horizon fee statistics.
+   */
+  feeSurgeConfig?: import("./feeSurgeDetector.js").FeeSurgeConfig;
+  /**
+   * When true, enables debug helpers such as {@link StellarSplitClient.parseXdrEnvelope}
+   * for inspecting in-flight transaction envelopes. Defaults to false.
+   */
+  debug?: boolean;
+  /**
+   * Optional fiat-to-asset price oracle adapter (see `PriceOracleAdapter` in
+   * types.ts). Used by `convertFiatToAsset` in currencyConverter.ts to
+   * resolve display conversions. Defaults to no oracle configured.
+   */
+  priceOracle?: import("./types.js").PriceOracleAdapter;
 }
 
 /** Network configuration. */
@@ -368,6 +565,12 @@ export interface NetworkConfig {
 
 export interface TxResult {
   txHash: string;
+}
+
+export interface InFlightRequestInfo {
+  id: string;
+  method: string;
+  startedAt: number;
 }
 
 /** TTL for cached NFT gate status results (30 seconds). */
@@ -461,8 +664,7 @@ export function verifyCompletionProof(proof: CompletionProof): {
   }
   return { valid: true };
 }
-
-export class StellarSplitClient {
+export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   private _mainServer!: SorobanRpc.Server;
   private _standby: WarmStandby | null = null;
   private _queue = new PriorityQueue();
@@ -471,6 +673,7 @@ export class StellarSplitClient {
   private _plugins = new Set<string>();
   private _pluginInstances: StellarSplitPlugin[] = [];
   private _pluginRegistry = new PluginRegistry();
+  private _metadataValidator: InvoiceMetadataValidator;
   private _dedup = new Deduplicator<Invoice>();
   private _cache: SimpleCache<any> | ICacheStore<any> | null = null;
   private _auditLogger: AuditLogger | null = null;
@@ -478,10 +681,11 @@ export class StellarSplitClient {
   private _rateLimiter: RateLimiter | null = null;
   private _rpcClient: IRPCClient | null = null;
   private _adapter: WalletAdapter | null = null;
-  private _hooks: InvoiceLifecycleHooks = {};
+  private _hooks: import("./types.js").InvoiceLifecycleHooks = {};
   private _retryOptions: RetryOptions | null = null;
   private _horizonReader: HorizonFallbackReader | null = null;
   private _idempotency: IdempotencyManager | null = null;
+  private _rollbackCoordinator: RollbackCoordinator | null = null;
   private _pool: ConnectionPool | null = null;
   /**
    * Effective pool size chosen at construction (or 0 when pooling is off).
@@ -491,6 +695,17 @@ export class StellarSplitClient {
    */
   private _effectiveRpcPoolSize = 0;
   private _batcher: BatchedRpcClient | null = null;
+
+  /**
+   * Live client instances, so {@link ProfilerSession} can instrument each
+   * client's RPC server.
+   *
+   * Held on the class rather than patched per-instance because the profiler
+   * wraps the prototype once but every client owns its own `server` object.
+   *
+   * @internal
+   */
+  static readonly _instances = new Set<StellarSplitClient>();
   private _telemetryHookManager = new TelemetryHookManager();
   private _timeoutManager: TimeoutManager | null = null;
   private _traceIdManager = new TraceIdManager();
@@ -500,10 +715,73 @@ export class StellarSplitClient {
   private _activeTransportType: TransportType = 'http';
   private _fallbackListeners: Array<(event: { from: 'websocket'; to: 'http' }) => void> = [];
   /** Admin keypair used to sign admin-only operations (freeze/unfreeze). */
+  /** Pluggable signing vault adapter (issue #589). */
+  private _signer: Signer | null = null;
+  /** Admin keypair used to sign admin-only operations (freeze/unfreeze). */
   private _adminKeypair: Keypair | null = null;
+  /** Resilient RPC wrapper providing retry + circuit breaker for all RPC calls. */
+  private _resilientRpc: ResilientRpcClient | null = null;
+  /** Health-weighted multi-endpoint balancer, present only when `config.rpcEndpoints` is set. */
+  private _rpcLoadBalancer: RpcLoadBalancer | null = null;
+  /**
+   * Optional secondary circuit breaker (src/resilience/CircuitBreaker.ts)
+   * guarding the transaction-submission path (`_submitTx`). Distinct from
+   * `_resilientRpc`'s breaker so existing `circuitBreaker: { breaker, retry }`
+   * configs keep working unchanged; enable via `advancedCircuitBreaker`.
+   */
+  private _advancedCircuitBreaker: AdvancedCircuitBreaker | null = null;
+  private _offlineQueue: import("./offlineQueue.js").OfflineQueue | null = null;
+  /** Optimistic UI cache for Invoice reads during a pending pay() call. */
+  private _optimisticCache: OptimisticCache<Invoice> | null = null;
+  private _sorobanFeatureDetector: SorobanFeatureDetector;
+  private _shutdownInProgress = false;
+  private _pluginsDestroyed = false;
+  private _runtimeShutdownPromise: Promise<void> | null = null;
+  private _requestSeq = 0;
+  private readonly _inFlightRequests = new Map<string, InFlightRequestInfo>();
+  private readonly _inFlightRequestPromises = new Map<string, Promise<unknown>>();
+  /** Network the client is currently bound to (see `switchNetwork`). */
+  private _activeEnvironment: NetworkEnvironment =
+    NetworkEnvironment.CUSTOM;
+  /** Resolved preset for the active network, when known. */
+  private _activePreset: NetworkPreset | null = null;
+  private readonly _managedHorizonStreams = new Set<{ stop(): void }>();
+  private readonly _stateMachine: InvoiceStateMachine;
+
+  // ---------------------------------------------------------------------------
+  // Issue #874: SDK Logger
+  // ---------------------------------------------------------------------------
+  private _logger: SdkLogger | null = null;
+
+  // ---------------------------------------------------------------------------
+  // Issue #876: Protocol Stats Cache
+  // ---------------------------------------------------------------------------
+  /** Cached protocol stats entry per contract address. */
+  private _protocolStatsCache: Map<string, { data: ProtocolStats; fetchedAt: number }> = new Map();
+  /**
+   * OpenTelemetry handle. Stays {@link noopOtelHandle} (zero overhead, no
+   * span objects created) unless `config.otel.enabled` is true, in which
+   * case it's swapped for a real handle once {@link _otelInitPromise}
+   * resolves (see the constructor).
+   */
+  private _otel: OtelHandle = noopOtelHandle;
+  private _otelInitPromise: Promise<void> | null = null;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private get server(): any {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (this._resilientRpc) return this._resilientRpc;
+  /**
+   * return
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     return (
       this._injectedRpcClient ??
       this._rpcClient ??
@@ -522,6 +800,12 @@ export class StellarSplitClient {
    * Fire lifecycle hooks for invoice creation.
    */
   private _fireOnCreated(invoice: Invoice): void {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._hooks?.onCreated) {
       try {
         this._hooks.onCreated(invoice);
@@ -535,6 +819,12 @@ export class StellarSplitClient {
    * Fire lifecycle hooks for invoice payment.
    */
   private _fireOnPaid(invoice: Invoice, payment: Payment): void {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._hooks?.onPaid) {
       try {
         this._hooks.onPaid(invoice, payment);
@@ -548,6 +838,12 @@ export class StellarSplitClient {
    * Fire lifecycle hooks for invoice release.
    */
   private _fireOnReleased(invoice: Invoice): void {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._hooks?.onReleased) {
       try {
         this._hooks.onReleased(invoice);
@@ -561,6 +857,12 @@ export class StellarSplitClient {
    * Fire lifecycle hooks for invoice refund.
    */
   private _fireOnRefunded(invoice: Invoice): void {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._hooks?.onRefunded) {
       try {
         this._hooks.onRefunded(invoice);
@@ -574,6 +876,12 @@ export class StellarSplitClient {
    * Fire lifecycle hooks for invoice cancellation.
    */
   private _fireOnCancelled(invoice: Invoice): void {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._hooks?.onCancelled) {
       try {
         this._hooks.onCancelled(invoice);
@@ -584,8 +892,29 @@ export class StellarSplitClient {
   }
 
   constructor(config: StellarSplitClientConfig) {
+  /**
+   * super
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    super();
+
+    // Register so ProfilerSession can wrap this client's RPC server.
+    StellarSplitClient._instances.add(this);
+  /**
+   * validateOrThrow
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     validateOrThrow(config);
     this.config = config;
+    this._activeEnvironment = detectNetworkEnvironment(config.networkPassphrase);
+    this._metadataValidator = new InvoiceMetadataValidator(
+      config.metadataSchema,
+      config.metadataThrowOnInvalid ?? true,
+    );
     const primaryUrl = Array.isArray(config.rpcUrl)
       ? config.rpcUrl[0]!
       : config.rpcUrl;
@@ -597,13 +926,89 @@ export class StellarSplitClient {
       config.container?.getWalletAdapter() ?? config.adapter ?? null;
 
     // Per-method timeout manager (Issue #1)
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (config.timeout !== undefined) {
       this._timeoutManager = new TimeoutManager(config.timeout);
     }
-    this._mainServer = new SorobanRpc.Server(primaryUrl, {
-      allowHttp: primaryUrl.startsWith("http://"),
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (config.rpcEndpoints && config.rpcEndpoints.length > 0) {
+      this._rpcLoadBalancer = new RpcLoadBalancer(config.rpcEndpoints, config.rpcLoadBalancer);
+      this._rpcLoadBalancer.on("endpoint:demoted", (event) => this.emit("endpoint:demoted", event));
+      this._rpcLoadBalancer.on("endpoint:reinstated", (event) => this.emit("endpoint:reinstated", event));
+      this._rpcLoadBalancer.start();
+      this._mainServer = this._rpcLoadBalancer.selectEndpoint().server as SorobanRpc.Server;
+    } else {
+      this._mainServer = new SorobanRpc.Server(primaryUrl, {
+        allowHttp: primaryUrl.startsWith("http://"),
+      });
+    }
+
+    // Circuit breaker + retry resilience layer (Issue #419)
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (config.circuitBreaker) {
+      const rpcTarget = this._injectedRpcClient ?? this._rpcClient ?? this._mainServer;
+      this._resilientRpc = new ResilientRpcClient(
+        rpcTarget,
+        config.circuitBreaker.retry,
+        config.circuitBreaker.breaker,
+      );
+      this._resilientRpc.on("circuit:open", () => this.emit("circuit:open", undefined));
+      this._resilientRpc.on("circuit:close", () => this.emit("circuit:close", undefined));
+      this._resilientRpc.on("circuit:half-open", () => this.emit("circuit:half-open", undefined));
+    }
+
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (config.advancedCircuitBreaker) {
+      this._advancedCircuitBreaker = new AdvancedCircuitBreaker(config.advancedCircuitBreaker, {
+        warn: (event) => this.emit("circuit_state_change", event),
+      });
+    }
+
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (config.optimisticCache) {
+      this._optimisticCache = new OptimisticCache<Invoice>();
+    }
+
+    this._stateMachine = new InvoiceStateMachine(config.stateMachine);
+
+    // Soroban protocol feature detection (Issue #529): probe once at startup;
+    // the detector caches internally and re-probes after its staleness window.
+    this._sorobanFeatureDetector = new SorobanFeatureDetector({ rpcUrl: primaryUrl });
+    this._sorobanFeatureDetector.detect().catch(() => {
+      // Best-effort startup probe; getSorobanFeatures() will retry on demand.
     });
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (
       !this._rpcClient &&
       Array.isArray(config.rpcUrl) &&
@@ -617,6 +1022,12 @@ export class StellarSplitClient {
     // when an external RPC client hasn't been injected via the DI container.
     const wantsPool =
       !this._rpcClient && !this._standby && (config.rpcPoolSize ?? 0) >= 2;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (wantsPool) {
       this._effectiveRpcPoolSize = Math.min(
         Math.max(config.rpcPoolSize!, 1),
@@ -634,21 +1045,75 @@ export class StellarSplitClient {
     this._cache = config.container?.getCacheStore() ??
       (config.cache?.enabled ? new SimpleCache<any>(config.cache) : null);
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (config.telemetry) {
       telemetry.init(config.telemetry);
     }
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (config.signingKeypair) {
+  /**
+   * addRequestInterceptor
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       addRequestInterceptor(
+  /**
+   * createRequestSigningInterceptor
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         createRequestSigningInterceptor(config.signingKeypair),
       );
     }
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (config.compression?.enabled) {
+  /**
+   * addRequestInterceptor
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       addRequestInterceptor(
+  /**
+   * createCompressionRequestInterceptor
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         createCompressionRequestInterceptor(config.compression),
       );
+  /**
+   * addResponseInterceptor
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       addResponseInterceptor(
+  /**
+   * createCompressionResponseInterceptor
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         createCompressionResponseInterceptor(config.compression),
       );
     }
@@ -656,52 +1121,698 @@ export class StellarSplitClient {
     // Initialize hooks
     this._hooks = config.hooks ?? {};
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (config.retry) {
       this._retryOptions = config.retry;
     }
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (config.horizonUrl) {
       this._horizonReader = new HorizonFallbackReader(config.horizonUrl);
     }
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (config.idempotency) {
       this._idempotency = new IdempotencyManager(config.idempotency);
     }
 
     // WebSocket transport (Issue #377)
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (config.transport === 'websocket') {
       this._transportType = 'websocket';
       this._activeTransportType = 'websocket';
       this._wsTransport = new WebSocketTransport(primaryUrl, config.wsUrl);
       this._wsTransport.onFallback((event: { from: 'websocket'; to: 'http' }) => {
         this._activeTransportType = 'http';
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         for (const cb of this._fallbackListeners) {
           try { cb(event); } catch { }
         }
       });
     }
 
+    // Pluggable signing vault adapter (issue #589)
+    this._signer = config.signer ?? null;
+
     // Admin keypair for admin-only operations
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (config.adminKeypair) {
       this._adminKeypair = config.adminKeypair;
     }
 
+  /**
+   * initHealthDashboard
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     initHealthDashboard(this.server, this._dedup);
 
     // Register and initialize config-level plugins
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (config.plugins) {
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       for (const plugin of config.plugins) {
         this.registerPlugin(plugin);
       }
     }
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     for (const p of this._pluginInstances) {
       p.onInit?.(this);
     }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (config.validatePassphrase !== false) {
+      void this._validateStartupConfig();
+    }
+
+    // OpenTelemetry instrumentation (opt-in, zero overhead when omitted/disabled).
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (config.otel?.enabled) {
+      const otelExporter = config.otel.exporterUrl
+        ? new OtelExporter({
+            exporterUrl: config.otel.exporterUrl,
+            serviceName: config.otel.serviceName,
+          })
+        : undefined;
+      this._otelInitPromise = createOtelHandle(config.otel, otelExporter)
+        .then((handle) => {
+          this._otel = handle;
+        })
+        .catch(() => {
+          // `@opentelemetry/api` isn't installed, or init otherwise failed --
+          // stay on the zero-overhead no-op handle rather than throwing.
+        });
+      this._instrumentOtel();
+    }
+
+    this._pluginRegistry.setClientContext({
+      on: (event, handler) => this.on(event as keyof SplitClientEventMap, handler as never),
+      off: (event, handler) => this.off(event as keyof SplitClientEventMap, handler as never),
+    });
+  }
+
+  /**
+   * Internal startup validation. Throws if the configured passphrase does not
+   * match the connected RPC node.
+   */
+  private async _validateStartupConfig(): Promise<void> {
+    const { NetworkPassphraseValidator } = await import(
+      "./network/NetworkPassphraseValidator.js"
+    );
+    const { PassphraseMismatchError } = await import("./errors.js");
+    const primaryUrl = Array.isArray(this.config.rpcUrl)
+      ? this.config.rpcUrl[0]!
+      : this.config.rpcUrl;
+    const result = await NetworkPassphraseValidator.validate(
+      this.config.networkPassphrase,
+      primaryUrl,
+    );
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (result.mismatch) {
+      throw new PassphraseMismatchError(result.configured, result.reported);
+    }
+  }
+
+  /**
+   * Live network switcher. Migrates state and re-subscribes.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  getOfflineQueue(): import("./offlineQueue.js").QueuedOperation[] {
+    return this._offlineQueue ? this._offlineQueue.getQueue() : [];
+  }
+
+  clearOfflineQueue(): void {
+    if (this._offlineQueue) this._offlineQueue.clear();
+  }
+
+  async switchTo(network: "mainnet" | "testnet" | "futurenet"): Promise<void> {
+    const { NetworkSwitcher } = await import("./network/NetworkSwitcher.js");
+    return NetworkSwitcher.switchTo(network, this);
+  }
+
+  /**
+   * isShutdownInProgress
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  isShutdownInProgress(): boolean {
+    return this._shutdownInProgress;
+  }
+
+  /**
+   * beginGracefulShutdown
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  beginGracefulShutdown(): void {
+    this._shutdownInProgress = true;
+  }
+
+  /**
+   * registerHorizonStreamManager
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  registerHorizonStreamManager(manager: { stop(): void }): () => void {
+    this._managedHorizonStreams.add(manager);
+  /**
+   * return
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    return () => {
+      this._managedHorizonStreams.delete(manager);
+    };
+  }
+
+  /**
+   * getInFlightRequests
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  getInFlightRequests(): InFlightRequestInfo[] {
+    return [...this._inFlightRequests.values()].sort(
+      (left, right) => left.startedAt - right.startedAt,
+    );
+  }
+
+  /**
+   * waitForInFlightRequests
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  async waitForInFlightRequests(): Promise<void> {
+    await Promise.allSettled([...this._inFlightRequestPromises.values()]);
+  }
+
+  /**
+   * finalizeShutdown
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  async finalizeShutdown(): Promise<void> {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (this._runtimeShutdownPromise) {
+      return this._runtimeShutdownPromise;
+    }
+
+    this.beginGracefulShutdown();
+    this._runtimeShutdownPromise = (async () => {
+      await this._destroyPlugins();
+  /**
+   * destroySubscriptionManager
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      destroySubscriptionManager(this.config.contractId);
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      for (const manager of this._managedHorizonStreams) {
+        manager.stop();
+      }
+      this._managedHorizonStreams.clear();
+
+      this._standby?.stop();
+      this._wsTransport?.disconnect();
+      this._wsTransport = null;
+
+      this._pool?.dispose();
+      this._pool = null;
+
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      if (this._cache && typeof (this._cache as any).persist === "function") {
+  /**
+   * await
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+        await (this._cache as any).persist();
+      }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      if (this._cache && typeof (this._cache as any).close === "function") {
+  /**
+   * await
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+        await (this._cache as any).close();
+      }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      if (
+        this._rpcClient &&
+  /**
+   * typeof
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+        typeof (this._rpcClient as any).close === "function"
+      ) {
+  /**
+   * await
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+        await (this._rpcClient as any).close();
+      }
+
+      telemetry.destroy();
+    })();
+
+    return this._runtimeShutdownPromise;
+  }
+
+  private async _destroyPlugins(): Promise<void> {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (this._pluginsDestroyed) return;
+    this._pluginsDestroyed = true;
+
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    for (const plugin of [...this._pluginInstances].reverse()) {
+      try {
+        await plugin.onDestroy?.(this);
+      } catch (error) {
+        console.error(
+          `[StellarSplitClient] Plugin "${plugin.name}" onDestroy error:`,
+          error,
+        );
+      }
+    }
+
+    this._pluginInstances = [];
+    this._plugins.clear();
+  }
+
+  private _assertWritable(): void {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (this._shutdownInProgress) {
+      throw new ShutdownInProgressError();
+    }
+  }
+
+  private _trackInFlightRequest<T>(
+    method: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const id = `${method}:${++this._requestSeq}`;
+    const info: InFlightRequestInfo = {
+      id,
+      method,
+      startedAt: Date.now(),
+    };
+
+    this._inFlightRequests.set(id, info);
+    const trackedPromise = (async () => operation())().finally(() => {
+      this._inFlightRequests.delete(id);
+      this._inFlightRequestPromises.delete(id);
+    });
+    this._inFlightRequestPromises.set(id, trackedPromise);
+    return trackedPromise;
+  }
+
+  /**
+   * The pluggable signing vault adapter (issue #589) provided at construction,
+   * or `null` when the client was created without one.
+   */
+  get signer(): Signer | null {
+    return this._signer;
+  }
+
+  /**
+   * Wraps every public StellarSplitClient method (every own, non-underscore-
+   * prefixed function on the prototype) so that calling it opens an OTel
+   * span (and records `split_sdk.rpc_call.*` / `split_sdk.tx.error.count`
+   * metrics) around the original implementation. Only ever invoked from the
+   * constructor when `config.otel.enabled` is true -- when disabled, this
+   * method is never called, no methods are wrapped, and there is no
+   * overhead whatsoever.
+   *
+   * Async methods (the vast majority: `pay`, `createInvoice`, `getInvoice`,
+   * ...) are wrapped with an async-aware span helper. The handful of
+   * synchronous methods (e.g. `switchNetwork`, `getSSEEndpoint`,
+   * `getPoolStats`) are wrapped with a synchronous helper that never awaits
+   * anything, so their return type/signature is preserved for callers.
+   */
+  private _instrumentOtel(): void {
+    const proto = Object.getPrototypeOf(this) as object;
+    const self = this as unknown as Record<string, unknown>;
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    for (const name of Object.getOwnPropertyNames(proto)) {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      if (name === "constructor" || name.startsWith("_")) continue;
+      const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      if (!descriptor || typeof descriptor.value !== "function") continue;
+      const original = descriptor.value as (...args: unknown[]) => unknown;
+      const isAsync = original.constructor.name === "AsyncFunction";
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      if (isAsync) {
+        self[name] = (...args: unknown[]) =>
+          this._withOtelSpanAsync(name, args, () => original.apply(this, args) as Promise<unknown>);
+      } else {
+        self[name] = (...args: unknown[]) =>
+          this._withOtelSpanSync(name, args, () => original.apply(this, args));
+      }
+    }
+  }
+
+  /** Best-effort `invoice.id` extraction from a method's first argument. */
+  private _otelInvoiceId(args: unknown[]): string | undefined {
+    const first = args[0];
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (typeof first === "string") return first;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (first && typeof first === "object") {
+      const obj = first as Record<string, unknown>;
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      for (const key of ["invoiceId", "invoice_id", "id"]) {
+        const value = obj[key];
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+        if (typeof value === "string") return value;
+      }
+    }
+    return undefined;
+  }
+
+  /** Best-effort `tx.hash` extraction from a method's resolved return value. */
+  private _otelTxHash(result: unknown): string | undefined {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (result && typeof result === "object") {
+      const value = (result as Record<string, unknown>).txHash;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      if (typeof value === "string") return value;
+    }
+    return undefined;
+  }
+
+  /** Shared span attribute setup applied to both the sync and async span helpers. */
+  private _otelStartSpan(name: string, args: unknown[]) {
+    const span = this._otel.startSpan(name);
+    span.setAttribute("stellar.network", this.config.networkPassphrase);
+    const rpcUrl = Array.isArray(this.config.rpcUrl) ? this.config.rpcUrl[0] : this.config.rpcUrl;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (rpcUrl) span.setAttribute("rpc.url", rpcUrl);
+    const invoiceId = this._otelInvoiceId(args);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (invoiceId) span.setAttribute("invoice.id", invoiceId);
+    return span;
+  }
+
+  private async _withOtelSpanAsync<T>(
+    name: string,
+    args: unknown[],
+    fn: () => Promise<T>,
+  ): Promise<T> {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (this._otelInitPromise) await this._otelInitPromise;
+    const span = this._otelStartSpan(name, args);
+    const startedAt = Date.now();
+    try {
+      const result = await fn();
+      const durationMs = Date.now() - startedAt;
+      span.setAttribute("rpc.duration_ms", durationMs);
+      const txHash = this._otelTxHash(result);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      if (txHash) span.setAttribute("tx.hash", txHash);
+      this._otel.recordRpcCall(durationMs, { method: name });
+      span.end();
+      return result;
+    } catch (error) {
+      const durationMs = Date.now() - startedAt;
+      span.setAttribute("rpc.duration_ms", durationMs);
+      span.recordError(error);
+      this._otel.recordRpcCall(durationMs, { method: name, error: true });
+      this._otel.recordTxError({ method: name });
+      span.end();
+      throw error;
+    }
+  }
+
+  private _withOtelSpanSync<T>(name: string, args: unknown[], fn: () => T): T {
+    const span = this._otelStartSpan(name, args);
+    const startedAt = Date.now();
+    try {
+      const result = fn();
+      const durationMs = Date.now() - startedAt;
+      span.setAttribute("rpc.duration_ms", durationMs);
+      const txHash = this._otelTxHash(result);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      if (txHash) span.setAttribute("tx.hash", txHash);
+      this._otel.recordRpcCall(durationMs, { method: name });
+      span.end();
+      return result;
+    } catch (error) {
+      const durationMs = Date.now() - startedAt;
+      span.setAttribute("rpc.duration_ms", durationMs);
+      span.recordError(error);
+      this._otel.recordRpcCall(durationMs, { method: name, error: true });
+      this._otel.recordTxError({ method: name });
+      span.end();
+      throw error;
+    }
+  }
+
+  /**
+   * Internal startup validation. Throws PassphraseMismatchError if
+   * the configured passphrase doesn't match the RPC node.
+   */
+  private async _validateStartupConfig(): Promise<void> {
+    const primaryUrl = Array.isArray(this.config.rpcUrl) ? this.config.rpcUrl[0]! : this.config.rpcUrl;
+    const result = await NetworkPassphraseValidator.validate(
+      this.config.networkPassphrase,
+      primaryUrl
+    );
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (result.mismatch) {
+      throw new PassphraseMismatchError(result.configured, result.reported);
+    }
+  }
+
+  /**
+   * Live network switcher. Migrates state and re-subscribes.
+   * @param network - 'mainnet' | 'testnet' | 'futurenet'
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  public async switchTo(network: 'mainnet' | 'testnet' | 'futurenet'): Promise<void> {
+    const { NetworkSwitcher } = await import("./network/NetworkSwitcher.js");
+    return NetworkSwitcher.switchTo(network, this);
   }
 
   /**
    * Performs a health check of the client's RPC connection and contract.
    * Resolves with status information or throws HealthCheckTimeoutError if taking > 5000ms.
+   */
+  /**
+   * Return the current Soroban protocol feature flags, detected once at
+   * startup and re-probed automatically after the detector's staleness
+   * window (default 1 hour). Emits `protocolUpgradeDetected` on the
+   * underlying detector when a re-probe observes a version change.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  async getSorobanFeatures(): Promise<SorobanFeatureFlags> {
+    return this._sorobanFeatureDetector.detect();
+  }
+
+  /**
+   * healthCheck
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async healthCheck(): Promise<HealthCheckResult> {
     const start = Date.now();
@@ -709,8 +1820,20 @@ export class StellarSplitClient {
       return await Promise.race([
         this._doHealthCheck(start),
         new Promise<never>((_, reject) =>
+  /**
+   * setTimeout
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           setTimeout(
             () =>
+  /**
+   * reject
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
               reject(
                 new HealthCheckTimeoutError(
                   "Health check timed out after 5000ms",
@@ -721,6 +1844,12 @@ export class StellarSplitClient {
         ),
       ]);
     } catch (e: any) {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (e instanceof HealthCheckTimeoutError) {
         throw e;
       }
@@ -748,6 +1877,12 @@ export class StellarSplitClient {
         await this.server.getContractWasmByContractId(this.config.contractId);
         contractDeployed = true;
       } catch (err: any) {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         if (!err.message?.includes("Could not obtain contract hash")) {
           // If we get here, it might be deployed but we couldn't fetch the wasm,
           // or it threw some other error. We'll conservatively say true if it's
@@ -772,9 +1907,23 @@ export class StellarSplitClient {
    * Enable or disable request batching for read methods (getInvoice, getPaymentHistory, getInvoiceExt).
    * Disabled by default — opt-in to batch concurrent RPC calls within a 10 ms window.
    * @param enabled - Pass `true` to enable batching, `false` to disable.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   setBatchingEnabled(enabled: boolean): void {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (enabled) {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (!this._batcher) {
         this._batcher = new BatchedRpcClient({
           fetchInvoice: (id: string) => this._fetchInvoice(id),
@@ -792,9 +1941,23 @@ export class StellarSplitClient {
    * Manually invalidate cache entries.
    * @param method Optional method name to invalidate.
    * @param args Optional arguments array to invalidate a specific call.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   public invalidateCache(method?: string, args?: any[]): void {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._cache) {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (typeof (this._cache as any).invalidate === "function") {
         (this._cache as any).invalidate(method, args);
       }
@@ -804,12 +1967,64 @@ export class StellarSplitClient {
   /**
    * Get cache statistics.
    * @returns Cache stats including hits, misses, size, and keys.
+   * @param params - The parameters for the method.
+   * @throws {Error} If the method fails.
    */
   public getCacheStats(): import("./cache.js").CacheStats | null {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._cache && typeof (this._cache as any).getStats === "function") {
+  /**
+   * return
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       return (this._cache as any).getStats();
     }
     return null;
+  }
+
+  /**
+   * Internal startup validation. Throws PassphraseMismatchError if
+   * the configured passphrase doesn't match the RPC node.
+   */
+  private async _validateStartupConfig(): Promise<void> {
+    const { NetworkPassphraseValidator } = await import("./network/NetworkPassphraseValidator.js");
+    const { PassphraseMismatchError } = await import("./errors.js");
+    const primaryUrl = Array.isArray(this.config.rpcUrl)
+      ? this.config.rpcUrl[0]!
+      : this.config.rpcUrl;
+    const result = await NetworkPassphraseValidator.validate(
+      this.config.networkPassphrase,
+      primaryUrl,
+    );
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (result.mismatch) {
+      throw new PassphraseMismatchError(result.configured, result.reported);
+    }
+  }
+
+  /**
+   * Live network switcher. Migrates state and re-subscribes.
+   * @param network - 'mainnet' | 'testnet' | 'futurenet'
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  public async switchTo(
+    network: "mainnet" | "testnet" | "futurenet",
+  ): Promise<void> {
+    const { NetworkSwitcher } = await import("./network/NetworkSwitcher.js");
+    return NetworkSwitcher.switchTo(network, this);
   }
 
   private _logAudit(
@@ -818,6 +2033,12 @@ export class StellarSplitClient {
     success: boolean,
     durationMs: number,
   ): void {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (!this._auditLogger) return;
     this._auditLogger.log({
       timestamp: Date.now(),
@@ -887,8 +2108,14 @@ export class StellarSplitClient {
     const timeoutMs =
       opts?.timeout ?? this._timeoutManager?.resolveTimeout(method);
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (timeoutMs !== undefined) {
-      return withTimeout(() => run(), timeoutMs, method);
+      return withTimeoutOrThrow(() => run(), timeoutMs, method);
     }
     return run();
   }
@@ -900,8 +2127,17 @@ export class StellarSplitClient {
   /**
    * Register a plugin that extends this client instance.
    * Throws if a plugin with the same name has already been registered.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   registerPlugin(plugin: StellarSplitPlugin): void {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._plugins.has(plugin.name)) {
       throw new PluginAlreadyRegisteredError(plugin.name);
     }
@@ -910,17 +2146,35 @@ export class StellarSplitClient {
     plugin.install?.(this);
   }
 
-  /** Register a middleware plugin (interceptor-style). */
-  use(plugin: SdkPlugin): void {
-    this._pluginRegistry.use(plugin);
+  /**
+   * Register a plugin with fluent API support.
+   * Plugins can extend the client with custom methods, intercept RPC calls,
+   * and subscribe to events.
+   *
+   * @param plugin - The plugin to install.
+   * @param options - Optional plugin configuration.
+   * @returns The client instance for method chaining.
+   * @throws {PluginAlreadyRegisteredError} if a plugin with the same name exists.
+   */
+  use(plugin: SdkPlugin, options?: Record<string, unknown>): this {
+    this._pluginRegistry.use(plugin, options);
+    return this;
   }
 
-  /** Deregister a middleware plugin by name. */
+  /** Deregister a middleware plugin by name.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
   removePlugin(name: string): void {
     this._pluginRegistry.removePlugin(name);
   }
 
-  /** Return the names of all active middleware plugins. */
+  /** Return the names of all active middleware plugins.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
   getPlugins(): string[] {
     return this._pluginRegistry.getPlugins();
   }
@@ -953,6 +2207,8 @@ export class StellarSplitClient {
    *   }
    * });
    * ```
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   setTelemetryHooks(hooks: TelemetryHooks): void {
     this._telemetryHookManager.setHooks(hooks);
@@ -960,6 +2216,9 @@ export class StellarSplitClient {
 
   /**
    * Remove all registered telemetry hooks.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   clearTelemetryHooks(): void {
     this._telemetryHookManager.clearHooks();
@@ -973,6 +2232,9 @@ export class StellarSplitClient {
    * Returns the resolved timeout (in ms) for each known SDK method.
    * Reflects both the `default` timeout and any per-method overrides.
    * Returns an empty object when no `timeout` option was set at construction.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   getTimeoutConfig(): Record<string, number> {
     return this._timeoutManager?.getTimeoutConfig() ?? {};
@@ -988,6 +2250,9 @@ export class StellarSplitClient {
    *
    * @example
    * sdk.setDefaultTraceIdGenerator(() => opentelemetry.trace.getActiveSpan()?.spanContext().traceId ?? crypto.randomUUID());
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   setDefaultTraceIdGenerator(generator: () => string): void {
     this._traceIdManager.setGenerator(generator);
@@ -1001,12 +2266,19 @@ export class StellarSplitClient {
    * Dispute an invoice by ID.
    * @param invoiceId - The ID of the invoice to dispute.
    * @returns The dispute ID and transaction hash.
+   * @throws {Error} If the method fails.
    */
   async disputeInvoice(invoiceId: string): Promise<DisputeResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "dispute_invoice",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       // Assuming the creator is the one calling dispute
@@ -1025,14 +2297,33 @@ export class StellarSplitClient {
    * Submit an arbiter's vote for a dispute.
    * @param vote - The arbiter vote parameters.
    * @returns The dispute ID and transaction hash.
+   * @throws {Error} If the method fails.
    */
   async submitArbiterVote(vote: ArbiterVote): Promise<DisputeResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "submit_arbiter_vote",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(vote.invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(vote.arbiter, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(vote.approve, { type: "bool" }),
       );
       const result = await this._submitTx(vote.arbiter, operation);
@@ -1054,6 +2345,7 @@ export class StellarSplitClient {
    * @param invoiceId - The ID of the invoice to resolve dispute for.
    * @param arbiter - The Stellar address of the arbiter (must sign).
    * @returns The dispute ID and transaction hash.
+   * @throws {Error} If the method fails.
    */
   async resolveDispute(
     invoiceId: string,
@@ -1063,6 +2355,12 @@ export class StellarSplitClient {
     try {
       const operation = this.contract.call(
         "resolve_dispute",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTx(arbiter, operation);
@@ -1079,12 +2377,19 @@ export class StellarSplitClient {
    * Raise a dispute on an invoice.
    * @param invoiceId - The ID of the invoice to dispute.
    * @returns The dispute ID and transaction hash.
+   * @throws {Error} If the method fails.
    */
   async raiseDispute(invoiceId: string): Promise<DisputeResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "dispute_invoice",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTx(this.config.contractId, operation);
@@ -1101,6 +2406,7 @@ export class StellarSplitClient {
    * Get the dispute status for an invoice.
    * @param invoiceId - The ID of the invoice to query.
    * @returns The dispute status.
+   * @throws {Error} If the method fails.
    */
   async getDisputeStatus(invoiceId: string): Promise<DisputeStatus> {
     return this._withCache("getDisputeStatus", [invoiceId], async () => {
@@ -1108,6 +2414,12 @@ export class StellarSplitClient {
       try {
         const operation = this.contract.call(
           "get_dispute_status",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           nativeToScVal(BigInt(invoiceId), { type: "u64" }),
         );
         const raw = (await this._simulateView(operation)) as Record<
@@ -1143,6 +2455,146 @@ export class StellarSplitClient {
     });
   }
 
+  /**
+   * Submit a vote on a disputed invoice (arbitrator only).
+   * @param params - Vote parameters (invoiceId, arbiter address, approve boolean)
+   * @returns Transaction result with hash
+   * @throws {Error} If the method fails.
+   */
+  async voteDispute(params: ArbiterVote): Promise<{ txHash: string }> {
+    return this._withTelemetry("voteDispute", params as unknown as Record<string, unknown>, async () => {
+      const operation = this.contract.call(
+        "vote_dispute",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+        nativeToScVal(BigInt(params.invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+        nativeToScVal(params.arbiter, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+        nativeToScVal(params.approve, { type: "bool" }),
+      );
+
+      const { txHash } = await this._submitTx(params.arbiter, operation);
+      return { txHash };
+    });
+  }
+
+  /**
+   * Add evidence to a dispute (stores IPFS CID in dispute notes).
+   * @param invoiceId - The invoice ID
+   * @param evidenceCid - IPFS CID of the evidence file
+   * @param fileName - Optional file name for reference
+   * @returns Transaction result with hash
+   * @throws {Error} If the method fails.
+   */
+  async addDisputeEvidence(
+    invoiceId: string,
+    evidenceCid: string,
+    fileName?: string,
+  ): Promise<{ txHash: string; cid: string }> {
+    return this._withTelemetry(
+      "addDisputeEvidence",
+      { invoiceId, evidenceCid, fileName } as Record<string, unknown>,
+  /**
+   * async
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      async () => {
+        // Note: This assumes the contract has an add_dispute_evidence method
+        // If not, this would need to be stored off-chain or via memo field
+        const note = fileName ? `${fileName}: ${evidenceCid}` : evidenceCid;
+        
+        const operation = this.contract.call(
+          "add_dispute_note",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+          nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+          nativeToScVal(note, { type: "string" }),
+        );
+
+        // Use current wallet for signing
+        const publicKey = await (this._adapter 
+          ? this._adapter.getAddress() 
+          : signTransaction.call(this, "", this.config.networkPassphrase).then(() => "")
+        );
+
+        const { txHash } = await this._submitTx(publicKey, operation);
+        return { txHash, cid: evidenceCid };
+      },
+    );
+  }
+
+  /**
+   * Get SSE endpoint URL for real-time updates (if available).
+   * This is used by useInvoiceStream hook for live updates.
+   * @param path - The SSE path (e.g., "/invoice/123")
+   * @returns SSE endpoint URL
+   * @throws {Error} If the method fails.
+   */
+  getSSEEndpoint(path: string): string {
+    // This would be configured based on your backend SSE server
+    // For now, return a placeholder that components can override
+    const primaryUrl = Array.isArray(this.config.rpcUrl) 
+      ? this.config.rpcUrl[0]! 
+      : this.config.rpcUrl;
+    const baseUrl = (this.config as any).sseUrl || primaryUrl.replace('/soroban/rpc', '');
+    return `${baseUrl}/sse${path}`;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Debug helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Decode a base64-encoded Stellar transaction envelope XDR into a structured,
+   * human-readable object. Useful for debugging, audit logging, and UI display.
+   *
+   * Only functional when {@link StellarSplitClientConfig.debug} is true;
+   * otherwise returns a placeholder indicating debug mode is off.
+   *
+   * @param xdrBase64 - Base64-encoded transaction envelope XDR.
+   * @returns A parsed envelope, or a notice when debug mode is disabled.
+   * @throws {Error} If the method fails.
+   */
+  parseXdrEnvelope(xdrBase64: string): ParsedEnvelope | { error: string } {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (!this.config.debug) {
+      return { error: "Debug mode is disabled. Set config.debug = true to enable XDR parsing." };
+    }
+    return parseEnvelope(xdrBase64);
+  }
+
   // ---------------------------------------------------------------------------
   // Public API
   // ---------------------------------------------------------------------------
@@ -1151,10 +2603,27 @@ export class StellarSplitClient {
    * Create a new on-chain invoice.
    *
    * @returns The new invoice ID and the transaction hash.
+   * @example
+   * const result = await client.createInvoice({ ...params });
+   * @param params - The parameters for the method.
+   * @throws {Error} If the method fails.
    */
   async createInvoice(
+    params: CreateInvoiceParams & { simulate: true },
+  ): Promise<SimulationResult>;
+  async createInvoice(
     params: CreateInvoiceParams,
-  ): Promise<{ invoiceId: string; txHash: string }> {
+  ): Promise<{ invoiceId: string; txHash: string }>;
+  async createInvoice(
+    params: CreateInvoiceParams,
+  ): Promise<{ invoiceId: string; txHash: string } | SimulationResult> {
+    // Issue #844 — `{ simulate: true }` performs a dry-run instead of submitting.
+    if (params.simulate) {
+      return this.simulate(
+        "create_invoice",
+        params as unknown as Record<string, unknown>,
+      );
+    }
     return this._withTelemetry(
       "createInvoice",
       {
@@ -1162,15 +2631,74 @@ export class StellarSplitClient {
         token: params.token,
         deadline: params.deadline,
       },
+  /**
+   * async
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       async () => {
         const startTime = Date.now();
         params = this._pluginRegistry.runBeforeCall("createInvoice", params);
         try {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           if (this.config.payloadGuard) {
+  /**
+   * validateInvoicePayload
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
             validateInvoicePayload(params, this.config.payloadGuard);
           }
 
+          this._metadataValidator.validate(params.metadata);
+
+          // Pre-submission split ratio validation: catch malformed ratio arrays
+          // early (ratio-sum violations, negative shares, duplicates, zeros).
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+          if (params.recipients.length > 1) {
+            const total = params.recipients.reduce((s, r) => s + r.amount, 0n);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+            if (total > 0n) {
+              const splitConfig: SplitConfig = {
+                shares: params.recipients.map((r) => ({
+                  address: r.address,
+                  share: Number(r.amount) / Number(total),
+                })),
+              };
+  /**
+   * validateSplitRatiosOrThrow
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+              validateSplitRatiosOrThrow(splitConfig);
+            }
+          }
+
           const gate = await this.checkNftGate(params.creator);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           if (gate.gated && !gate.hasNft) {
             throw new NftGateRequiredError(
               params.creator,
@@ -1179,18 +2707,48 @@ export class StellarSplitClient {
           }
 
           const recipientAddresses = params.recipients.map((r) =>
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
             nativeToScVal(r.address, { type: "address" }),
           );
           const recipientAmounts = params.recipients.map((r) =>
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
             nativeToScVal(r.amount, { type: "i128" }),
           );
 
           const operation = this.contract.call(
             "create_invoice",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
             nativeToScVal(params.creator, { type: "address" }),
             xdr.ScVal.scvVec(recipientAddresses),
             xdr.ScVal.scvVec(recipientAmounts),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
             nativeToScVal(params.token, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
             nativeToScVal(params.deadline, { type: "u64" }),
           );
 
@@ -1245,14 +2803,53 @@ export class StellarSplitClient {
    * @throws {InvoiceNotFoundError} If the source invoice does not exist.
    */
   async cloneInvoice(
-    sourceId: string,
-    overrides: CloneOverrides = {},
+    sourceId: string | bigint,
+    rawOverrides: CloneOverrides & InvoiceParamOverrides = {},
   ): Promise<string> {
     const startTime = Date.now();
-    const sourceInvoice = await this.getInvoice(sourceId);
+    const sourceInvoice = await this.getInvoice(sourceId.toString());
+    const overrides = this._normalizeCloneOverrides(
+      rawOverrides,
+      sourceInvoice.recipients.length,
+    );
+
+    // -------------------------------------------------------------------
+    // Cloneability pre-flight validation (#486)
+    // -------------------------------------------------------------------
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (!overrides.skipValidation) {
+      const rpcUrl = Array.isArray(this.config.rpcUrl)
+        ? this.config.rpcUrl[0]
+        : this.config.rpcUrl;
+      const validator = new InvoiceCloneabilityValidator({
+        horizonUrl: overrides.horizonUrl ?? this.config.horizonUrl,
+        rpcUrl,
+      });
+      const report = await validator.validate(sourceInvoice);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      if (!report.cloneable) {
+        throw new InvoiceNotCloneableError(report);
+      }
+    }
 
     const mapEntries: xdr.ScMapEntry[] = [];
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (overrides.newDeadline !== undefined) {
       mapEntries.push(
         new xdr.ScMapEntry({
@@ -1263,6 +2860,12 @@ export class StellarSplitClient {
         }),
       );
     }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (overrides.newAmounts !== undefined) {
       mapEntries.push(
         new xdr.ScMapEntry({
@@ -1273,6 +2876,12 @@ export class StellarSplitClient {
         }),
       );
     }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (overrides.newRecipients !== undefined) {
       mapEntries.push(
         new xdr.ScMapEntry({
@@ -1282,6 +2891,16 @@ export class StellarSplitClient {
               nativeToScVal(r, { type: "address" }),
             ),
           ) as xdr.ScVal,
+        }),
+      );
+    }
+    // Optional title override (issue #850). Serialised as `new_title`; the
+    // contract ignores unknown override keys, so older deployments are safe.
+    if (overrides.newTitle !== undefined) {
+      mapEntries.push(
+        new xdr.ScMapEntry({
+          key: nativeToScVal("new_title", { type: "symbol" }) as xdr.ScVal,
+          val: nativeToScVal(overrides.newTitle, { type: "string" }) as xdr.ScVal,
         }),
       );
     }
@@ -1296,6 +2915,12 @@ export class StellarSplitClient {
         val: xdr.ScVal.scvVec(
           overrides.newOverflowBehavior !== undefined
             ? [
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
                 nativeToScVal(overrides.newOverflowBehavior, {
                   type: "symbol",
                 }) as xdr.ScVal,
@@ -1306,6 +2931,12 @@ export class StellarSplitClient {
     );
 
     const args: xdr.ScVal[] = [
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(BigInt(sourceId), { type: "u64" }),
       xdr.ScVal.scvMap(mapEntries),
     ];
@@ -1324,8 +2955,20 @@ export class StellarSplitClient {
       const id = scValToNative(result.returnValue).toString() as string;
       newInvoiceId = id;
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (this._cache) {
         const cloneDepth =
+  /**
+   * typeof
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           typeof (sourceInvoice as unknown as Record<string, unknown>)
             .cloneDepth === "number"
             ? ((sourceInvoice as unknown as Record<string, unknown>)
@@ -1335,8 +2978,8 @@ export class StellarSplitClient {
         const optimisticInvoice: Invoice = {
           ...sourceInvoice,
           id,
-          clonedFrom: sourceId,
-          parentInvoiceId: sourceId,
+          clonedFrom: sourceId.toString(),
+          parentInvoiceId: sourceId.toString(),
           cloneDepth,
           funded: 0n,
           payments: [],
@@ -1351,14 +2994,369 @@ export class StellarSplitClient {
     } catch (error) {
       telemetry.recordMethod("cloneInvoice", false, Date.now() - startTime);
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (cacheWritten && newInvoiceId && this._cache) {
         this._cache.invalidate(newInvoiceId);
       }
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (error instanceof Error && error.message.includes("not found")) {
-        throw new InvoiceNotFoundError(sourceId);
+        throw new InvoiceNotFoundError(sourceId.toString());
       }
       throw error;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #850 — clone lineage
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Return the full ancestor chain for an invoice, ordered root → … → invoiceId.
+   *
+   * The chain always ends with `invoiceId` itself. A non-cloned invoice returns
+   * a single-element array containing its own ID.
+   *
+   * @param invoiceId - The invoice whose lineage should be resolved.
+   * @returns Invoice IDs as `bigint[]` in root-to-leaf order.
+   * @throws {CloneChainTooDeepError} If the clone chain is cyclic or too deep.
+   */
+  async getLineage(invoiceId: string | bigint): Promise<bigint[]> {
+    const chain = await this.resolveCloneChain(invoiceId.toString());
+    return chain.map((invoice) => BigInt(invoice.id));
+  }
+
+  /**
+   * Normalise `InvoiceParamOverrides` onto the contract's `CloneOverrides`
+   * shape, applying the same field validation as `createInvoice` (issue #850).
+   *
+   * @param input - Raw overrides supplied by the caller.
+   * @param recipientCount - Number of recipients on the source invoice.
+   * @returns Validated contract-level overrides.
+   * @throws {ValidationError} If any override is malformed.
+   */
+  private _normalizeCloneOverrides(
+    input: CloneOverrides & InvoiceParamOverrides,
+    recipientCount: number,
+  ): CloneOverrides {
+    const out: CloneOverrides = { ...input };
+
+    if (input.title !== undefined) {
+      if (typeof input.title !== "string" || input.title.trim().length === 0) {
+        throw new ValidationError(
+          "cloneInvoice override `title` must be a non-empty string.",
+        );
+      }
+      out.newTitle = input.title.trim();
+    }
+
+    if (input.deadline !== undefined) {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      if (
+        typeof input.deadline !== "number" ||
+        !Number.isFinite(input.deadline) ||
+        input.deadline <= nowSeconds
+      ) {
+        throw new ValidationError(
+          "cloneInvoice override `deadline` must be a future unix timestamp in seconds.",
+        );
+      }
+      out.newDeadline = input.deadline;
+    }
+
+    if (input.recipients !== undefined) {
+      if (
+        !Array.isArray(input.recipients) ||
+        input.recipients.length === 0 ||
+        input.recipients.some(
+          (address) =>
+            typeof address !== "string" ||
+            !/^[GC][A-Z2-7]{55}$/.test(address),
+        )
+      ) {
+        throw new ValidationError(
+          "cloneInvoice override `recipients` must be a non-empty array of valid Stellar addresses.",
+        );
+      }
+      out.newRecipients = [...input.recipients];
+    }
+
+    if (input.targetAmount !== undefined) {
+      if (typeof input.targetAmount !== "bigint" || input.targetAmount <= 0n) {
+        throw new ValidationError(
+          "cloneInvoice override `targetAmount` must be a positive bigint (stroops).",
+        );
+      }
+      const count = out.newRecipients?.length ?? recipientCount;
+      if (count <= 0) {
+        throw new ValidationError(
+          "cloneInvoice override `targetAmount` requires at least one recipient.",
+        );
+      }
+      // Split the total evenly, assigning any remainder stroops to the first
+      // recipient so the parts always sum back to `targetAmount`.
+      const base = input.targetAmount / BigInt(count);
+      const remainder = input.targetAmount - base * BigInt(count);
+      out.newAmounts = Array.from({ length: count }, (_, index) =>
+        index === 0 ? base + remainder : base,
+      );
+      if (out.newAmounts.some((amount) => amount <= 0n)) {
+        throw new ValidationError(
+          "cloneInvoice override `targetAmount` is too small to split across recipients.",
+        );
+      }
+    }
+
+    if (
+      out.newAmounts !== undefined &&
+      out.newRecipients !== undefined &&
+      out.newAmounts.length !== out.newRecipients.length
+    ) {
+      throw new ValidationError(
+        "cloneInvoice overrides must provide one amount per recipient.",
+      );
+    }
+
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #842 — real-time invoice event streaming
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Subscribe to real-time state changes for a single invoice.
+   *
+   * Polls the Soroban `getEvents` RPC (`pollIntervalMs`, default 3000ms),
+   * deduplicates events by ledger sequence + topic hash, and reconnects with
+   * exponential backoff (up to `maxRetries`, default 5) before emitting an
+   * `error` lifecycle event.
+   *
+   * @param invoiceId - The invoice ID to watch.
+   * @param callback  - Invoked once per new {@link InvoiceEvent}.
+   * @param options   - Optional poll/backoff/storage overrides.
+   * @returns A {@link Subscription} whose `unsubscribe()` stops all polling.
+   * @example
+   * const sub = client.subscribeInvoice(42n, (event) => console.log(event.type));
+   * // later
+   * sub.unsubscribe();
+   */
+  subscribeInvoice(
+    invoiceId: bigint | string,
+    callback: (event: InvoiceEvent) => void,
+    options: SubscriptionOptions = {},
+  ): Subscription {
+    return createInvoiceSubscription(
+      this.server,
+      this.config.contractId,
+      invoiceId.toString(),
+      callback,
+      options,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #844 — generic dry-run simulation
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Simulate any contract method against Soroban RPC without submitting a
+   * transaction or consuming a sequence number.
+   *
+   * Accepts either a camelCase client method name (`createInvoice`, `pay`,
+   * `release`, `refund`, `approveRelease`, `cloneInvoice`) or the raw contract
+   * entry point (`create_invoice`, `pay`, `release_invoice`, `refund_invoice`,
+   * `approve_release`, `clone_invoice`).
+   *
+   * @param method - Method name or contract entry point to simulate.
+   * @param params - Parameters for the method.
+   * @returns A {@link SimulationResult}; `success` is `false` (rather than a
+   *          throw) when the contract rejects the call.
+   */
+  async simulate(
+    method: string,
+    params: Record<string, unknown> = {},
+  ): Promise<SimulationResult> {
+    const operation = this._buildSimulationOperation(method, params);
+    const source = String(
+      params.creator ??
+        params.payer ??
+        params.source ??
+        params.approver ??
+        "",
+    );
+    if (!/^G[A-Z2-7]{55}$/.test(source)) {
+      throw new ValidationError(
+        "simulate() requires a Stellar account `source` (or `creator`/`payer`) to build the dry-run transaction.",
+      );
+    }
+    const account = await this.server
+      .getAccount(source)
+      .catch(() => new Account(source, "0"));
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(operation)
+      .setTimeout(30)
+      .build();
+
+    const simResult = await this.server.simulateTransaction(tx);
+    return this._toSimulationResult(simResult);
+  }
+
+  /** Convert a raw Soroban simulation response into a {@link SimulationResult}. */
+  private _toSimulationResult(
+    sim: SorobanRpc.Api.SimulateTransactionResponse,
+  ): SimulationResult {
+    const emptyFootprint: LedgerFootprint = {
+      readBytes: 0n,
+      writeBytes: 0n,
+      readLedgerEntries: 0n,
+      writeLedgerEntries: 0n,
+    };
+
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      return {
+        success: false,
+        error: (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error,
+        fee: 0n,
+        cpuInsns: 0n,
+        memBytes: 0n,
+        footprint: emptyFootprint,
+      };
+    }
+
+    const success = sim as SorobanRpc.Api.SimulateTransactionSuccessResponse;
+    let footprint = emptyFootprint;
+    try {
+      const resources = success.transactionData.build().resources();
+      const ledgerFootprint = resources.footprint();
+      footprint = {
+        readBytes: BigInt(resources.readBytes()),
+        writeBytes: BigInt(resources.writeBytes()),
+        readLedgerEntries: BigInt(ledgerFootprint.readOnly().length),
+        writeLedgerEntries: BigInt(ledgerFootprint.readWrite().length),
+      };
+    } catch {
+      // Restore/error responses may omit `transactionData`; leave zeros.
+    }
+
+    const cost = (success as unknown as {
+      cost?: { cpuInsns?: string; memBytes?: string };
+    }).cost;
+
+    return {
+      success: true,
+      fee: BigInt(success.minResourceFee ?? "0"),
+      cpuInsns: BigInt(cost?.cpuInsns ?? 0),
+      memBytes: BigInt(cost?.memBytes ?? 0),
+      footprint,
+    };
+  }
+
+  /**
+   * Build the contract operation for {@link simulate} from a method name and
+   * a plain parameter object.
+   */
+  private _buildSimulationOperation(
+    method: string,
+    params: Record<string, unknown>,
+  ): xdr.Operation {
+    const aliases: Record<string, string> = {
+      createInvoice: "create_invoice",
+      pay: "pay",
+      release: "release_invoice",
+      releaseInvoice: "release_invoice",
+      releaseGroup: "release_invoice_group",
+      refund: "refund_invoice",
+      refundInvoice: "refund_invoice",
+      approveRelease: "approve_release",
+      cloneInvoice: "clone_invoice",
+    };
+    const entryPoint = aliases[method] ?? method;
+
+    switch (entryPoint) {
+      case "create_invoice": {
+        const recipients = (params.recipients ?? []) as Array<{
+          address: string;
+          amount: bigint;
+        }>;
+        if (!Array.isArray(recipients) || recipients.length === 0) {
+          throw new ValidationError(
+            "simulate(create_invoice) requires a non-empty `recipients` array.",
+          );
+        }
+        return this.contract.call(
+          "create_invoice",
+          nativeToScVal(String(params.creator), { type: "address" }),
+          xdr.ScVal.scvVec(
+            recipients.map((r) => nativeToScVal(r.address, { type: "address" })),
+          ),
+          xdr.ScVal.scvVec(
+            recipients.map((r) => nativeToScVal(r.amount, { type: "i128" })),
+          ),
+          nativeToScVal(String(params.token), { type: "address" }),
+          nativeToScVal(Number(params.deadline), { type: "u64" }),
+        );
+      }
+      case "pay":
+        return this.contract.call(
+          "pay",
+          nativeToScVal(String(params.payer), { type: "address" }),
+          nativeToScVal(BigInt(params.invoiceId as string | number | bigint), {
+            type: "u64",
+          }),
+          nativeToScVal(params.amount, { type: "i128" }),
+          nativeToScVal(Boolean(params.donateOnFailure ?? false), {
+            type: "bool",
+          }),
+        );
+      case "clone_invoice":
+        return this.contract.call(
+          "clone_invoice",
+          nativeToScVal(
+            BigInt(
+              (params.sourceId ?? params.invoiceId) as string | number | bigint,
+            ),
+            { type: "u64" },
+          ),
+          xdr.ScVal.scvMap([]),
+        );
+      case "release_invoice":
+      case "refund_invoice":
+      case "approve_release":
+        return this.contract.call(
+          entryPoint,
+          nativeToScVal(
+            BigInt((params.invoiceId ?? params.id) as string | number | bigint),
+            { type: "u64" },
+          ),
+        );
+      case "release_invoice_group":
+        return this.contract.call(
+          "release_invoice_group",
+          nativeToScVal(String(params.creator), { type: "address" }),
+          nativeToScVal(BigInt(params.groupId as string | number | bigint), {
+            type: "u64",
+          }),
+        );
+      default:
+        return this.contract.call(
+          entryPoint,
+          ...Object.values(params).map((value) => nativeToScVal(value as never)),
+        );
     }
   }
 
@@ -1366,16 +3364,81 @@ export class StellarSplitClient {
    * Pay toward an invoice.
    *
    * @returns The transaction hash.
+   * @example
+   * const result = await client.pay({ ...params });
+   * @param params - The parameters for the method.
+   * @throws {Error} If the method fails.
    */
-  async pay(params: PayParams): Promise<TxResult> {
+  async pay(params: PayParams & { simulate: true }): Promise<SimulationResult>;
+  async pay(params: PayParams): Promise<TxResult>;
+  async pay(params: PayParams): Promise<TxResult | SimulationResult> {
+    // Issue #844 — `{ simulate: true }` performs a dry-run instead of submitting.
+    if (params.simulate) {
+      return this.simulate(
+        "pay",
+        params as unknown as Record<string, unknown>,
+      );
+    }
     const startTime = Date.now();
     params = this._pluginRegistry.runBeforeCall("pay", params);
+
+    let optimistic: { commit: CommitFn; rollback: RollbackFn } | null = null;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (this._optimisticCache) {
+      const current = this._cache?.get(`getInvoice:${JSON.stringify([params.invoiceId])}`) as
+        | Invoice
+        | undefined;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      if (current) {
+        const predicted = getOptimisticInvoice(current, {
+          payer: params.payer,
+          amount: params.amount,
+          donateOnFailure: params.donateOnFailure,
+        });
+        optimistic = this._optimisticCache.applyOptimistic(params.invoiceId, predicted, current);
+      }
+    }
+
     try {
       const operation = this.contract.call(
         "pay",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(params.payer, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(params.invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(params.amount, { type: "i128" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(params.donateOnFailure ?? false, { type: "bool" }),
       );
 
@@ -1384,11 +3447,13 @@ export class StellarSplitClient {
         ? await executeWithRetry(submitFn, this._retryOptions)
         : await withRetry(submitFn, this.config.maxRetries ?? 3, 1000);
       this._cache?.invalidate(params.invoiceId);
+      optimistic?.commit();
       telemetry.recordMethod("pay", true, Date.now() - startTime);
       return this._pluginRegistry.runAfterCall("pay", {
         txHash: result.txHash,
       });
     } catch (error) {
+      optimistic?.rollback();
       telemetry.recordMethod("pay", false, Date.now() - startTime);
       this._pluginRegistry.runOnError("pay", error);
       throw error;
@@ -1396,23 +3461,366 @@ export class StellarSplitClient {
   }
 
   /**
+   * Submit a payment, optionally routed through a WaterfallPlan
+   * (see WaterfallRouter.plan()) instead of the default single-amount
+   * round-robin split. When a plan is supplied, one `pay` operation per
+   * satisfied tier is built and submitted in a single transaction envelope,
+   * in the plan's declared priority order.
+   *
+   * @param params.waterfallPlan - Plan produced by `WaterfallRouter.plan()`.
+   * @param params.allowPartial  - Submit even if the plan has unsatisfied tiers.
+   *   Defaults to the value carried on the plan itself (`plan.allowPartial`).
+   * @throws WaterfallInsufficientFundsError if any tier is unsatisfied and
+   *   partial submission wasn't allowed.
+   */
+  /**
+   * Preflight checks before submitting a payment.
+   *
+   * Verifies the invoice is pending, not expired, and the payer has trustline/balance.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  async preflightCheck(params: {
+    invoiceId: string;
+    payer: string;
+    amount: bigint;
+  }): Promise<{
+    valid: boolean;
+    expiry: import("./preflightChecker.js").InvoiceExpiryResult;
+    payerReadiness: import("./preflightChecker.js").PayerReadinessResult;
+  }> {
+    const invoice = await this.getInvoice(params.invoiceId);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (invoice.status !== "Pending") {
+      throw new InvoiceNotPendingError(params.invoiceId);
+    }
+
+    const expiry = checkInvoiceExpiry(Number(invoice.deadline), params.invoiceId);
+
+    // Call checkPayerReadiness, mapping the RPC server to a custom object that
+    // returns the account balances via getAccountBalances (Horizon).
+    const fakeServer = {
+      getAccount: async (address: string) => {
+        const normalizedBalances = await this.getAccountBalances(address);
+        const balances = normalizedBalances.map((nb) => {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+          if (nb.asset === "native") {
+            return {
+              balance: nb.balance,
+              asset_type: "native",
+            };
+          } else {
+            const [code, issuer] = nb.asset.split(":");
+            return {
+              balance: nb.balance,
+              asset_type: "credit_alphanum4",
+              asset_code: code,
+              asset_issuer: issuer,
+            };
+          }
+        });
+        return { balances };
+      },
+    } as any;
+
+    const payerReadiness = await checkPayerReadiness(
+      fakeServer,
+      params.payer,
+      params.amount,
+      invoice.token
+    );
+
+    const valid = expiry.valid && payerReadiness.ready;
+
+    return {
+      valid,
+      expiry,
+      payerReadiness,
+    };
+  }
+
+  /**
+   * Fetch a payment receipt for an invoice and payer.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  async getReceipt(invoiceId: string, payerAddress: string): Promise<PaymentReceipt> {
+    return generatePaymentReceipt(this, invoiceId, payerAddress);
+  }
+
+  /**
+   * submitPayment
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  async submitPayment(params: {
+    invoiceId: string;
+    payer: string;
+    amount: bigint;
+    donateOnFailure?: boolean;
+    waterfallPlan?: WaterfallPlan;
+    allowPartial?: boolean;
+    expectedContentHash?: string;
+  }): Promise<TxResult> {
+    // Verify invoice content hash if provided (integrity check)
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (params.expectedContentHash) {
+      const invoice = await this.getInvoice(params.invoiceId);
+      const valid = await verifyInvoiceHash(invoice, params.expectedContentHash);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      if (!valid) {
+        const computed = await hashInvoice(invoice);
+        throw new InvoiceIntegrityError(params.invoiceId, params.expectedContentHash, computed);
+      }
+    }
+
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (!params.waterfallPlan) {
+      return this.pay({
+        payer: params.payer,
+        invoiceId: params.invoiceId,
+        amount: params.amount,
+        donateOnFailure: params.donateOnFailure,
+      });
+    }
+
+    const plan = params.waterfallPlan;
+    const allowPartial = params.allowPartial ?? plan.allowPartial ?? false;
+    const hasUnsatisfiedTier = plan.steps.some((step) => !step.satisfied);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (hasUnsatisfiedTier && !allowPartial) {
+      throw new WaterfallInsufficientFundsError(params.invoiceId, {
+        unsatisfiedTiers: plan.steps.filter((s) => !s.satisfied).map((s) => s.recipient),
+      });
+    }
+
+    const fundedSteps = plan.steps.filter((step) => step.satisfied && step.amount > 0n);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (fundedSteps.length === 0) {
+      throw new WaterfallInsufficientFundsError(params.invoiceId);
+    }
+
+    const operations = fundedSteps.map((step) =>
+      this.contract.call(
+        "pay",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+        nativeToScVal(params.payer, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+        nativeToScVal(BigInt(params.invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+        nativeToScVal(step.amount, { type: "i128" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+        nativeToScVal(params.donateOnFailure ?? false, { type: "bool" }),
+      ),
+    );
+
+    const result = await this._submitWaterfallTx(params.payer, operations);
+    this._cache?.invalidate(params.invoiceId);
+
+    // Record a rollback checkpoint for the submitted legs. The on-chain
+    // submission is atomic (all-or-nothing), so every funded step succeeded
+    // together; downstream app-layer failures (e.g. webhook delivery) are
+    // reconciled by callers via RollbackCoordinator.markLegFailed.
+    const coordinator = this.getRollbackCoordinator();
+    coordinator.begin(
+      result.txHash,
+      params.invoiceId,
+      fundedSteps.map((step) => ({ recipient: step.recipient, amount: step.amount })),
+    );
+    fundedSteps.forEach((_, index) => coordinator.markLegSuccess(result.txHash, index));
+
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Build and submit a single transaction envelope containing one contract
+   * operation per waterfall step, preserving priority order.
+   */
+  private async _submitWaterfallTx(
+    sourceAddress: string,
+    operations: xdr.Operation[],
+  ): Promise<{ txHash: string; returnValue: xdr.ScVal }> {
+    const account = await this.server.getAccount(sourceAddress);
+    const builder = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    });
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    for (const operation of operations) {
+      builder.addOperation(operation);
+    }
+    const tx = builder.setTimeout(30).build();
+
+    const submit = () => this._doSubmitWaterfallSend(tx, sourceAddress);
+    return this._advancedCircuitBreaker ? this._advancedCircuitBreaker.execute(submit) : submit();
+  }
+
+  private async _doSubmitWaterfallSend(
+    tx: Transaction,
+    sourceAddress: string,
+  ): Promise<{ txHash: string; returnValue: xdr.ScVal }> {
+    const simResult = await this.server.simulateTransaction(tx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (SorobanRpc.Api.isSimulationError(simResult)) {
+      throw parseSorobanError(simResult.error);
+    }
+
+    const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
+    const signedXdr = await (this._adapter
+      ? this._adapter.signTransaction(preparedTx.toXDR(), this.config.networkPassphrase)
+      : signTransaction(preparedTx.toXDR(), this.config.networkPassphrase));
+
+    const sendResult = await this.server.sendTransaction(
+      TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase),
+    );
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (sendResult.status === "ERROR") {
+      throw new TransactionFailedError(
+        `Waterfall transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
+        sendResult.hash,
+        JSON.stringify(sendResult.errorResult),
+      );
+    }
+
+    const txHash = sendResult.hash;
+    let getResult = await this.server.getTransaction(txHash);
+    let attempts = 0;
+  /**
+   * while
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    while (getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND && attempts < 20) {
+      await new Promise((r) => setTimeout(r, 1500));
+      getResult = await this.server.getTransaction(txHash);
+      attempts++;
+    }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+      throw new TransactionNotConfirmedError(String(getResult.status));
+    }
+
+    const returnValue =
+      (getResult as SorobanRpc.Api.GetSuccessfulTransactionResponse).returnValue ?? xdr.ScVal.scvVoid();
+    return { txHash, returnValue };
+  }
+
+  /**
    * Create multiple invoices in a single transaction.
    *
    * @param params - Array of invoice creation parameters (1-5 items)
    * @returns All created invoice IDs and the transaction hash
+   * @throws {Error} If the method fails.
    */
   async batchCreateInvoices(
     params: CreateInvoiceParams[],
   ): Promise<{ invoiceIds: string[]; txHash: string }> {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (params.length === 0 || params.length > 5) {
       throw new InvalidBatchSizeError("1-5 items", params.length);
     }
 
     const invoiceParams = params.map((p) => {
       const recipientAddresses = p.recipients.map((r) =>
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(r.address, { type: "address" }),
       );
       const recipientAmounts = p.recipients.map((r) =>
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(r.amount, { type: "i128" }),
       );
 
@@ -1448,9 +3856,21 @@ export class StellarSplitClient {
     );
 
     const firstParam = params[0];
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (!firstParam) throw new InvalidBatchSizeError("non-empty array", 0);
     const result = await this._submitTx(firstParam.creator, operation);
     const invoiceIds = (
+  /**
+   * scValToNative
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       scValToNative(result.returnValue) as (string | number)[]
     ).map((id) => id.toString());
     return { invoiceIds, txHash: result.txHash };
@@ -1464,12 +3884,24 @@ export class StellarSplitClient {
     args: any[],
     fetcher: () => Promise<T>,
   ): Promise<T> {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (!this._cache) {
       return fetcher();
     }
 
     const key = `${methodName}:${JSON.stringify(args)}`;
     const cached = this._cache.get(key);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (cached !== undefined) {
       return cached as T;
     }
@@ -1481,11 +3913,31 @@ export class StellarSplitClient {
 
   /**
    * Fetch an invoice by ID. Returns cached result if within TTL.
+   *
+   * When the invoice has an `accessPolicy` set and the client was constructed
+   * with a `tokenGateController`, the caller's token balance is verified before
+   * the invoice data is returned. Throws {@link TokenGateAccessDeniedError} when
+   * the caller does not meet the balance requirement (and `strict !== false`).
+   * @example
+   * const result = await client.getInvoice({ ...params });
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async getInvoice(
     invoiceId: string,
     opts?: { retry?: PerMethodRetryOptions; dedupe?: boolean; traceId?: string; timeout?: number }
   ): Promise<Invoice> {
+    const optimistic = this._optimisticCache?.get(invoiceId);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (optimistic !== undefined) {
+      return optimistic;
+    }
 
     return this._withCache("getInvoice", [invoiceId], async () => {
 
@@ -1496,24 +3948,273 @@ export class StellarSplitClient {
       const useDedupe = opts?.dedupe !== false;
       const effectiveRetry =
         opts?.retry ?? (this._retryOptions ? {} : undefined);
+
+      let invoice: Invoice;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (this._retryOptions && effectiveRetry !== undefined) {
-        return await executeWithRetry(
+        invoice = await executeWithRetry(
           () =>
             useDedupe ? this._dedup.dedupe(invoiceId, fetcher) : fetcher(),
           this._retryOptions,
           opts?.retry,
         );
+      } else {
+        invoice = await (useDedupe ? this._dedup.dedupe(invoiceId, fetcher) : fetcher());
       }
-      return useDedupe ? this._dedup.dedupe(invoiceId, fetcher) : fetcher();
+
+      // Token-gate access check: verify caller balance when policy is set.
+      const gateController = this.config.tokenGateController;
+      const callerId = this.config.callerAccountId;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+      if (gateController && callerId && invoice.accessPolicy) {
+        await gateController.verify(callerId, invoice.accessPolicy);
+      }
+
+      return invoice;
     });
   }
 
   /**
    * Returns deduplication statistics for observability.
    * @returns { deduped: number, total: number } — deduped is how many calls were short-circuited.
+   * @param params - The parameters for the method.
+   * @throws {Error} If the method fails.
    */
   getDedupStats(): { deduped: number; total: number } {
     return this._dedup.getDedupStats();
+  }
+
+  /**
+   * The InvoiceStateMachine backing updateInvoiceStatus(). Exposed so
+   * consumers can attach `on('transition', ...)` / `on('invalidTransition', ...)`
+   * lifecycle hooks.
+   */
+  get stateMachine(): InvoiceStateMachine {
+    return this._stateMachine;
+  }
+
+  /**
+   * The RpcLoadBalancer backing multi-endpoint calls, present only when
+   * `config.rpcEndpoints` was provided. `null` for single-`rpcUrl` configs.
+   * Exposed so consumers can attach `on('endpoint:demoted', ...)` /
+   * `on('endpoint:reinstated', ...)` hooks or inspect `getEndpointStates()`.
+   */
+  get rpcLoadBalancer(): RpcLoadBalancer | null {
+    return this._rpcLoadBalancer;
+  }
+
+  /**
+   * Updates an invoice's status, validating the transition through
+   * InvoiceStateMachine. Throws InvalidTransitionError (with
+   * `{ from, to, allowed }`) if the transition isn't allowed from the
+   * invoice's current status.
+   *
+   * When optimisticCache is enabled, the result is written into it
+   * immediately so subsequent getInvoice() calls see the new status.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  async updateInvoiceStatus(invoiceId: string, to: InvoiceStatus): Promise<Invoice> {
+    const current = await this.getInvoice(invoiceId);
+    const updated = this._stateMachine.transition(current, to);
+
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (this._optimisticCache) {
+      this._optimisticCache.applyOptimistic(invoiceId, updated, current).commit();
+    }
+
+    return updated;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Invoice Version History integration (#550)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Update an invoice with new field values and record a version snapshot
+   * via {@link InvoiceVersionTracker} before overwriting the stored state.
+   *
+   * If no `versionTracker` is provided in the config, the method still applies
+   * the update — versioning is opt-in via config.
+   *
+   * @param invoiceId   - The invoice to update.
+   * @param updates     - Partial invoice fields to apply (merged over the current state).
+   * @param changedBy   - The Stellar address responsible for the change.
+   * @returns The updated invoice after all mutations are applied.
+   * @throws {Error} If the method fails.
+   */
+  async updateInvoice(
+    invoiceId: string,
+    updates: Partial<Invoice>,
+    changedBy: string,
+  ): Promise<Invoice> {
+    const current = await this.getInvoice(invoiceId);
+
+    // Record current state as a version BEFORE overwriting
+    const tracker = (this.config as Record<string, unknown>)["versionTracker"] as
+      | import("./invoiceVersionTracker.js").InvoiceVersionTracker
+      | undefined;
+
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (tracker) {
+      await tracker.record(invoiceId, current, changedBy);
+    }
+
+    const updated: Invoice = { ...current, ...updates };
+
+    // Write the updated invoice back into the optimistic cache so subsequent
+    // getInvoice() calls see the new state immediately.
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (this._optimisticCache) {
+      this._optimisticCache.applyOptimistic(invoiceId, updated, current).commit();
+    } else if (this._cache) {
+      this._cache.invalidate("getInvoice", [invoiceId]);
+    }
+
+    return updated;
+  }
+
+  /**
+   * Subscribe to typed InvoiceEvent payloads for a single invoice via the
+   * shared SubscriptionManager, instead of polling fetch methods. The first
+   * call for a given invoice ID starts the manager's poll-then-push bridge
+   * and restores any cursor persisted from a previous session/tab, so
+   * events emitted during an outage are replayed on reconnect.
+   *
+   * @param invoiceId - The invoice ID to watch.
+   * @param handler   - Called with each typed InvoiceEvent as it arrives.
+   * @param opts      - Optional per-subscription overrides (poll interval, backoff, storage).
+   * @returns Unsubscribe function scoped to this handler only.
+   * @throws {Error} If the method fails.
+   */
+  subscribe(
+    invoiceId: string,
+    handler: (event: InvoiceEvent) => void,
+    opts?: SubscriptionManagerOptions,
+  ): () => void {
+    const manager = getSubscriptionManager(this.server, this.config.contractId, opts);
+    return manager.subscribe(invoiceId, handler, opts);
+  }
+
+  /**
+   * Stop receiving InvoiceEvents for an invoice ID. Removes every handler
+   * registered via `subscribe()` for that invoice and releases the
+   * underlying poll timer.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  unsubscribe(invoiceId: string): void {
+  /**
+   * getSubscriptionManager
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    getSubscriptionManager(this.server, this.config.contractId).unsubscribe(invoiceId);
+  }
+
+  /**
+   * The advanced CLOSED/OPEN/HALF_OPEN circuit breaker guarding
+   * transaction submission, or null when `advancedCircuitBreaker` was not
+   * passed to the constructor. Use `client.circuitBreaker.getState()` to
+   * inspect the current state for dashboards/alerting.
+   */
+  get circuitBreaker(): { getState(): CircuitBreakerStateSnapshot } | null {
+    return this._advancedCircuitBreaker;
+  }
+
+  /**
+   * The rollback coordinator tracking split-payment leg checkpoints created
+   * by `submitPayment`'s waterfall path. Lazily instantiated on first use.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  getRollbackCoordinator(): RollbackCoordinator {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (!this._rollbackCoordinator) {
+      this._rollbackCoordinator = new RollbackCoordinator(this._idempotency ?? undefined);
+    }
+    return this._rollbackCoordinator;
+  }
+
+  /** The configured fiat-to-asset price oracle adapter, or null if none was provided. */
+  get priceOracle(): import("./types.js").PriceOracleAdapter | null {
+    return this.config.priceOracle ?? null;
+  }
+
+  /**
+   * The optimistic UI cache, or null when `optimisticCache` was not passed
+   * to the constructor. Use `client.optimisticCache?.onRollback(...)` to
+   * react to a prediction being reverted after a failed transaction.
+   */
+  get optimisticCache(): OptimisticCache<Invoice> | null {
+    return this._optimisticCache;
+  }
+
+  /**
+   * Returns the current circuit breaker state, or null if no circuit breaker
+   * is configured.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  getCircuitBreakerState(): import("./circuitBreaker.js").CircuitBreakerState | null {
+    return this._resilientRpc?.circuitBreaker?.state ?? null;
+  }
+
+  /**
+   * Returns the number of consecutive failures recorded by the circuit breaker,
+   * or null if no circuit breaker is configured.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  getCircuitBreakerFailureCount(): number | null {
+    return this._resilientRpc?.circuitBreaker?.failureCount ?? null;
+  }
+
+  /**
+   * Manually reset the circuit breaker to the CLOSED state.
+   * No-op if no circuit breaker is configured.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  resetCircuitBreaker(): void {
+    this._resilientRpc?.circuitBreaker?.reset();
   }
 
   private async _fetchInvoice(invoiceId: string, traceId?: string): Promise<Invoice> {
@@ -1528,6 +4229,12 @@ export class StellarSplitClient {
     const fetchFn = async (): Promise<Invoice> => {
       const operation = this.contract.call(
         "get_invoice",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
 
@@ -1552,6 +4259,12 @@ export class StellarSplitClient {
         .build();
 
       const simResult = await this.server.simulateTransaction(tx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (SorobanRpc.Api.isSimulationError(simResult)) {
         throw parseSorobanError(simResult.error, invoiceId);
       }
@@ -1559,6 +4272,12 @@ export class StellarSplitClient {
       const returnVal = (
         simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse
       ).result?.retval;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (!returnVal) throw new InvoiceNotFoundError(invoiceId);
 
       const invoice = this._parseInvoice(invoiceId, scValToNative(returnVal));
@@ -1568,6 +4287,12 @@ export class StellarSplitClient {
 
     try {
       let invoice: Invoice;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (this._degradation) {
         const result = await this._degradation.wrapRead(invoiceId, fetchFn);
         invoice = result.data;
@@ -1581,6 +4306,12 @@ export class StellarSplitClient {
         result: invoice,
         durationMs,
       });
+  /**
+   * recordCall
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       recordCall(true);
       return invoice;
     } catch (error) {
@@ -1591,6 +4322,12 @@ export class StellarSplitClient {
         result: undefined,
         durationMs,
       });
+  /**
+   * recordCall
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       recordCall(false);
       throw error;
     }
@@ -1599,6 +4336,8 @@ export class StellarSplitClient {
   /**
    * Check invoice compliance against built-in and configured rules.
    * @param invoiceId - Invoice ID to validate
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async checkCompliance(
     invoiceId: string,
@@ -1611,6 +4350,9 @@ export class StellarSplitClient {
 
   /**
    * Fetch all payments for an invoice.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async getPayments(invoiceId: string): Promise<Payment[]> {
     const startTime = Date.now();
@@ -1631,6 +4373,7 @@ export class StellarSplitClient {
    *
    * @param proof - CompletionProof object from the contract.
    * @returns { valid: boolean, reason?: string }
+   * @throws {Error} If the method fails.
    */
   verifyCompletionProof(proof: CompletionProof): {
     valid: boolean;
@@ -1641,6 +4384,9 @@ export class StellarSplitClient {
 
   /**
    * Reconcile an invoice's reported funded amount with its payment records and historical payment events.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async reconcilePayments(
     invoiceId: string,
@@ -1663,6 +4409,12 @@ export class StellarSplitClient {
           const rawAmount = raw.amount;
           let amount: bigint;
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           if (typeof rawAmount === "bigint") {
             amount = rawAmount;
           } else if (typeof rawAmount === "number") {
@@ -1721,11 +4473,20 @@ export class StellarSplitClient {
 
   /**
    * Generate a typed receipt for a released invoice.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async generateReceipt(invoiceId: string): Promise<InvoiceReceipt> {
     const startTime = Date.now();
     try {
       const invoice = await this.getInvoice(invoiceId);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (invoice.status !== "Released") {
         throw new InvoiceNotReleasedError(invoiceId, invoice.status);
       }
@@ -1758,6 +4519,7 @@ export class StellarSplitClient {
    *
    * @param invoiceId - The invoice ID to snapshot.
    * @returns An immutable, timestamped snapshot object.
+   * @throws {Error} If the method fails.
    */
   async snapshotInvoice(invoiceId: string): Promise<InvoiceSnapshot> {
     const invoice = await this.getInvoice(invoiceId);
@@ -1769,6 +4531,7 @@ export class StellarSplitClient {
    *
    * @param ids - Invoice IDs to resolve.
    * @returns Results in the same order as the input IDs.
+   * @throws {Error} If the method fails.
    */
   async resolveBatch(ids: string[]): Promise<BatchResolveResult[]> {
     const settled = await Promise.allSettled(
@@ -1776,6 +4539,12 @@ export class StellarSplitClient {
     );
     return settled.map((result, i) => {
       const invoiceId = ids[i]!;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (result.status === "fulfilled") {
         return { invoiceId, success: true as const, invoice: result.value };
       }
@@ -1807,12 +4576,19 @@ export class StellarSplitClient {
    *
    * @param creatorAddress - The Stellar address of the invoice creator.
    * @returns Gate status including whether gating applies and NFT ownership.
+   * @throws {Error} If the method fails.
    */
   async checkNftGate(creatorAddress: string): Promise<NftGateResult> {
     return this._withCache("checkNftGate", [creatorAddress], async () => {
       const startTime = Date.now();
       const now = Date.now();
       const cached = this._nftGateCache.get(creatorAddress);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (cached && now - cached.timestamp < NFT_GATE_CACHE_TTL_MS) {
         telemetry.recordMethod("checkNftGate", true, Date.now() - startTime);
         return cached.result;
@@ -1821,6 +4597,12 @@ export class StellarSplitClient {
       try {
         const operation = this.contract.call(
           "check_nft_gate",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           nativeToScVal(creatorAddress, { type: "address" }),
         );
 
@@ -1843,13 +4625,20 @@ export class StellarSplitClient {
     });
   }
 
-  /** Clears the NFT gate status cache (useful for testing). */
+  /** Clears the NFT gate status cache (useful for testing).
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
   clearNftGateCache(): void {
     this._nftGateCache.clear();
   }
 
   /**
    * Resolves the forward chain for an invoice.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async getForwardChain(
     invoiceId: string,
@@ -1863,10 +4652,28 @@ export class StellarSplitClient {
     let currentId: string | undefined = invoiceId;
     let depth = 0;
 
+  /**
+   * while
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     while (currentId) {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (depth >= 10) {
         throw new ForwardChainTooDeepError(10, currentId);
       }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (visited.has(currentId)) {
         throw new CircularForwardChainError(currentId);
       }
@@ -1888,9 +4695,18 @@ export class StellarSplitClient {
 
   /**
    * Gracefully shutdown the SDK client, flush pending operations, and close internal resources.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async shutdown(): Promise<void> {
     // Tear down plugins in reverse registration order
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     for (const p of this._pluginInstances.reverse()) {
       try {
         await p.onDestroy?.(this);
@@ -1908,6 +4724,7 @@ export class StellarSplitClient {
       await this._queue.shutdown();
     } finally {
       this._standby?.stop();
+      this._rpcLoadBalancer?.stop();
 
       this._wsTransport?.disconnect();
       this._wsTransport = null;
@@ -1915,16 +4732,58 @@ export class StellarSplitClient {
       this._pool?.dispose();
       this._pool = null;
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (this._cache && typeof (this._cache as any).persist === "function") {
+  /**
+   * await
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         await (this._cache as any).persist();
       }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (this._cache && typeof (this._cache as any).close === "function") {
+  /**
+   * await
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         await (this._cache as any).close();
       }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (
         this._rpcClient &&
+  /**
+   * typeof
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         typeof (this._rpcClient as any).close === "function"
       ) {
+  /**
+   * await
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         await (this._rpcClient as any).close();
       }
 
@@ -1934,11 +4793,20 @@ export class StellarSplitClient {
 
   /**
    * Cancel multiple invoices in parallel without aborting on individual failures.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async bulkCancel(ids: string[]): Promise<BulkResult[]> {
     return this._executeBulkInvoiceAction(ids, (invoiceId) => {
       const operation = this.contract.call(
         "cancel_invoice",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       return this._submitTx(this.config.contractId, operation);
@@ -1947,11 +4815,20 @@ export class StellarSplitClient {
 
   /**
    * Archive multiple invoices in parallel without aborting on individual failures.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async bulkArchive(ids: string[]): Promise<BulkResult[]> {
     return this._executeBulkInvoiceAction(ids, (invoiceId) => {
       const operation = this.contract.call(
         "archive_invoice",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       return this._submitTx(this.config.contractId, operation);
@@ -1960,6 +4837,9 @@ export class StellarSplitClient {
 
   /**
    * Export multiple invoices in parallel and return formatted results by invoice ID.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async bulkExport(
     ids: string[],
@@ -1974,6 +4854,12 @@ export class StellarSplitClient {
     );
 
     return settled.reduce<Record<string, string>>((acc, result, index) => {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (result.status === "fulfilled") {
         acc[ids[index]!] = result.value.data;
       }
@@ -1990,6 +4876,12 @@ export class StellarSplitClient {
     );
     return settled.map((result, index) => {
       const invoiceId = ids[index]!;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (result.status === "fulfilled") {
         return { invoiceId, success: true };
       }
@@ -2008,6 +4900,8 @@ export class StellarSplitClient {
    * Save an invoice template for reuse.
    *
    * @returns The transaction hash.
+   * @param params - The parameters for the method.
+   * @throws {Error} If the method fails.
    */
   async saveTemplate(
     creator: string,
@@ -2016,18 +4910,48 @@ export class StellarSplitClient {
     const startTime = Date.now();
     try {
       const recipientAddresses = template.recipients.map((r) =>
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(r.address, { type: "address" }),
       );
       const recipientAmounts = template.recipients.map((r) =>
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(r.amount, { type: "i128" }),
       );
 
       const operation = this.contract.call(
         "save_template",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(creator, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(template.name, { type: "string" }),
         xdr.ScVal.scvVec(recipientAddresses),
         xdr.ScVal.scvVec(recipientAmounts),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(template.token, { type: "address" }),
       );
 
@@ -2044,6 +4968,8 @@ export class StellarSplitClient {
    * Create an invoice from a saved template.
    *
    * @returns The new invoice ID and the transaction hash.
+   * @param params - The parameters for the method.
+   * @throws {Error} If the method fails.
    */
   async createFromTemplate(
     creator: string,
@@ -2054,8 +4980,26 @@ export class StellarSplitClient {
     try {
       const operation = this.contract.call(
         "create_from_template",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(creator, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(templateName, { type: "string" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(deadline, { type: "u64" }),
       );
 
@@ -2079,6 +5023,9 @@ export class StellarSplitClient {
 
   /**
    * List all template names for a creator.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async listTemplates(creator: string): Promise<string[]> {
     return this._withCache("listTemplates", [creator], async () => {
@@ -2086,6 +5033,12 @@ export class StellarSplitClient {
       try {
         const operation = this.contract.call(
           "list_templates",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           nativeToScVal(creator, { type: "address" }),
         );
 
@@ -2102,6 +5055,9 @@ export class StellarSplitClient {
 
   /**
    * Get all recurring invoices for a creator.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async getRecurringInvoices(creator: string): Promise<Invoice[]> {
     const startTime = Date.now();
@@ -2131,13 +5087,27 @@ export class StellarSplitClient {
    * Cancel a recurring invoice.
    *
    * @returns The transaction hash.
+   * @param params - The parameters for the method.
+   * @throws {Error} If the method fails.
    */
   async cancelRecurring(invoiceId: string, creator: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "cancel_invoice",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(creator, { type: "address" }),
       );
 
@@ -2154,6 +5124,8 @@ export class StellarSplitClient {
    * Update amounts for a recurring invoice.
    *
    * @returns The transaction hash.
+   * @param params - The parameters for the method.
+   * @throws {Error} If the method fails.
    */
   async updateRecurringAmount(
     invoiceId: string,
@@ -2166,7 +5138,19 @@ export class StellarSplitClient {
 
       const operation = this.contract.call(
         "update_recurring_amount",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(creator, { type: "address" }),
         xdr.ScVal.scvVec(amountVals),
       );
@@ -2194,6 +5178,7 @@ export class StellarSplitClient {
    * @param creator - Stellar address of the creator.
    * @param options - Optional pagination options (cursor, limit). Default page size is 20.
    * @returns A page of invoice IDs with a nextCursor for subsequent pages.
+   * @throws {Error} If the method fails.
    */
   async getInvoicesByCreator(
     creator: string,
@@ -2202,11 +5187,23 @@ export class StellarSplitClient {
     return this._withCache(
       "getInvoicesByCreator",
       [creator, options],
+  /**
+   * async
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       async () => {
         const limit = options.limit ?? 20;
 
         const operation = this.contract.call(
           "get_invoices_by_creator",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           nativeToScVal(creator, { type: "address" }),
         );
 
@@ -2234,6 +5231,7 @@ export class StellarSplitClient {
    * @param recipient - Stellar address of the recipient.
    * @param options   - Optional pagination options (cursor, limit). Default page size is 20.
    * @returns A page of invoice IDs with a nextCursor for subsequent pages.
+   * @throws {Error} If the method fails.
    */
   async getInvoicesByRecipient(
     recipient: string,
@@ -2242,11 +5240,23 @@ export class StellarSplitClient {
     return this._withCache(
       "getInvoicesByRecipient",
       [recipient, options],
+  /**
+   * async
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       async () => {
         const limit = options.limit ?? 20;
 
         const operation = this.contract.call(
           "get_invoices_by_recipient",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           nativeToScVal(recipient, { type: "address" }),
         );
 
@@ -2265,6 +5275,12 @@ export class StellarSplitClient {
           .build();
 
         const simResult = await this.server.simulateTransaction(tx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         if (SorobanRpc.Api.isSimulationError(simResult)) {
           throw new SimulationFailedError(
             `Simulation failed: ${simResult.error}`,
@@ -2276,6 +5292,12 @@ export class StellarSplitClient {
         const returnVal = (
           simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse
         ).result?.retval;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         if (!returnVal) throw new NoReturnValueError("getInvoicesByRecipient");
 
         const raw = scValToNative(returnVal);
@@ -2297,27 +5319,108 @@ export class StellarSplitClient {
   }
 
   /**
+   * Query invoices with a rich, composable filter, sort and pagination.
+   *
+   * All filtering is applied client-side against the invoices the contract
+   * returns for `filter.creator` (or, when no creator is given, the full set
+   * of invoices the caller has already indexed locally). The result is a
+   * {@link InvoicePage} carrying a `nextCursor` for subsequent pages.
+   *
+   * Because the contract has no query endpoint for status/amount/date, this
+   * method fetches the candidate invoice IDs first and then applies every
+   * predicate in-memory — prefer supplying `creator` to bound the fetch.
+   *
+   * @param filter - The composed query. All supplied fields combine with AND.
+   * @returns A page of matching invoices plus a cursor when more remain.
+   * @throws {ValidationError} If the filter is inconsistent (e.g.
+   *   `minAmount > maxAmount`) or the cursor is malformed.
+   *
+   * @example
+   * ```ts
+   * const page = await client.queryInvoices({
+   *   creator: "GABC...",
+   *   status: ["Pending", "Released"],
+   *   minAmount: 1000n,
+   *   fromDate: Date.UTC(2026, 0, 1) / 1000,
+   *   tags: ["urgent"],
+   *   sort: "highest",
+   *   limit: 10,
+   * });
+   * ```
+   */
+  async queryInvoices(filter: InvoiceFilter = {}): Promise<InvoicePage> {
+    const startTime = Date.now();
+    try {
+      if (filter.creator === undefined) {
+        throw new ValidationError(
+          "queryInvoices requires a 'creator' — the contract has no global invoice index",
+        );
+      }
+
+      // Fetch every invoice ID for the creator (cursor-paging through the
+      // on-chain list) so filters are applied to the complete result set.
+      const ids: string[] = [];
+      let cursor: string | undefined;
+      do {
+        const page: PaginatedResult<string> = await this.getInvoicesByCreator(
+          filter.creator,
+          cursor !== undefined ? { cursor } : {},
+        );
+        ids.push(...page.items);
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor !== undefined);
+
+      const invoices = await Promise.all(ids.map((id) => this.getInvoice(id)));
+      const result = new InvoiceQueryEngine(invoices).query(filter);
+      telemetry.recordMethod("queryInvoices", true, Date.now() - startTime);
+      return result;
+    } catch (error) {
+      telemetry.recordMethod("queryInvoices", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  /**
    * Check the health of the RPC endpoint.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async checkRPCHealth(): Promise<RPCHealth> {
-    return checkRPCHealth(this.server);
+    const health = await checkRPCHealth(this.server);
+    if (health.status !== "down" && this._offlineQueue?.config?.enabled) { void this._offlineQueue.drain(); }
+    return health;
   }
 
   /**
    * Create a group of linked invoices.
    *
    * @returns The new group ID and transaction hash.
+   * @param params - The parameters for the method.
+   * @throws {Error} If the method fails.
    */
   async createGroup(
     creator: string,
     invoiceIds: string[],
   ): Promise<{ groupId: string; txHash: string }> {
     const invoiceIdsBigInt = invoiceIds.map((id) =>
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(BigInt(id), { type: "u64" }),
     );
 
     const operation = this.contract.call(
       "create_invoice_group",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(creator, { type: "address" }),
       xdr.ScVal.scvVec(invoiceIdsBigInt),
     );
@@ -2329,10 +5432,19 @@ export class StellarSplitClient {
 
   /**
    * Get the status of an invoice group.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async getGroupStatus(groupId: string): Promise<InvoiceGroup> {
     const operation = this.contract.call(
       "get_invoice_group",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(BigInt(groupId), { type: "u64" }),
     );
 
@@ -2343,6 +5455,12 @@ export class StellarSplitClient {
     return {
       groupId,
       invoiceIds: (raw.invoiceIds as (string | number)[]).map((id) =>
+  /**
+   * String
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         String(id),
       ),
       allFunded: Boolean(raw.allFunded),
@@ -2353,11 +5471,39 @@ export class StellarSplitClient {
    * Release all invoices in a group.
    *
    * @returns The transaction hash.
+   * @param params - The parameters for the method.
+   * @throws {Error} If the method fails.
    */
-  async releaseGroup(creator: string, groupId: string): Promise<TxResult> {
+  async releaseGroup(
+    creator: string,
+    groupId: string,
+    options: { simulate: true },
+  ): Promise<SimulationResult>;
+  async releaseGroup(creator: string, groupId: string): Promise<TxResult>;
+  async releaseGroup(
+    creator: string,
+    groupId: string,
+    options?: { simulate?: boolean },
+  ): Promise<TxResult | SimulationResult> {
+    // Issue #844 — `{ simulate: true }` performs a dry-run instead of submitting.
+    if (options?.simulate) {
+      return this.simulate("release_invoice_group", { creator, groupId });
+    }
     const operation = this.contract.call(
       "release_invoice_group",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(creator, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(BigInt(groupId), { type: "u64" }),
     );
 
@@ -2366,10 +5512,253 @@ export class StellarSplitClient {
   }
 
   /**
+   * Attest an invoice with a statement.
+   * @param invoiceId - Invoice ID to attest
+   * @param statement - Attestation statement (max 256 chars)
+   * @param payer - Payer address
+   * @returns Transaction hash
+   * @throws {InvalidAttestationError} if statement exceeds 256 chars
+   * @throws {Error} If the method fails.
+   */
+  async attestInvoice(
+    invoiceId: string,
+    statement: string,
+    payer: string
+  ): Promise<TxResult> {
+    if (statement.length > 256) {
+      throw new InvalidAttestationError("Statement must not exceed 256 characters");
+    }
+
+    const operation = this.contract.call(
+      "attest_invoice",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+      nativeToScVal(statement, { type: "string" }),
+      nativeToScVal(payer, { type: "address" })
+    );
+
+    const result = await this._submitTx(payer, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Revoke an attestation on an invoice.
+   * @param invoiceId - Invoice ID
+   * @param payer - Payer address
+   * @returns Transaction hash
+   * @throws {Error} If the method fails.
+   */
+  async revokeAttestation(invoiceId: string, payer: string): Promise<TxResult> {
+    const operation = this.contract.call(
+      "revoke_attestation",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+      nativeToScVal(payer, { type: "address" })
+    );
+
+    const result = await this._submitTx(payer, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Get all attestations for an invoice.
+   * @param invoiceId - Invoice ID
+   * @returns Array of attestations
+   * @throws {Error} If the method fails.
+   */
+  async getAttestations(invoiceId: string): Promise<Attestation[]> {
+    const operation = this.contract.call(
+      "get_attestations",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" })
+    );
+
+    const raw = (await this._simulateView(operation)) as Array<Record<string, unknown>>;
+    return raw.map((a) => ({
+      attester: a.attester as string,
+      statement: a.statement as string,
+      timestamp: BigInt(a.timestamp as string | number),
+      revoked: Boolean(a.revoked),
+    }));
+  }
+
+  /**
+   * Create a campaign group.
+   * @param creator - Creator address
+   * @param name - Group name
+   * @param description - Group description
+   * @returns Group ID and transaction hash
+   * @throws {Error} If the method fails.
+   */
+  async createGroup(
+    creator: string,
+    name: string,
+    description: string
+  ): Promise<{ groupId: string; txHash: string }> {
+    const operation = this.contract.call(
+      "create_group",
+      nativeToScVal(creator, { type: "address" }),
+      nativeToScVal(name, { type: "string" }),
+      nativeToScVal(description, { type: "string" })
+    );
+
+    const result = await this._submitTx(creator, operation);
+    const groupId = scValToNative(result.returnValue).toString();
+    return { groupId, txHash: result.txHash };
+  }
+
+  /**
+   * Add an invoice to a group.
+   * @param creator - Creator address
+   * @param groupId - Group ID
+   * @param invoiceId - Invoice ID to add
+   * @returns Transaction hash
+   * @throws {Error} If caller is not the group owner or other errors.
+   */
+  async addInvoiceToGroup(
+    creator: string,
+    groupId: string,
+    invoiceId: string
+  ): Promise<TxResult> {
+    const operation = this.contract.call(
+      "add_invoice_to_group",
+      nativeToScVal(creator, { type: "address" }),
+      nativeToScVal(BigInt(groupId), { type: "u64" }),
+      nativeToScVal(BigInt(invoiceId), { type: "u64" })
+    );
+
+    const result = await this._submitTx(creator, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Get statistics for a group.
+   * @param groupId - Group ID
+   * @returns Group statistics
+   * @throws {Error} If the method fails.
+   */
+  async getGroupStats(groupId: string): Promise<GroupStats> {
+    const operation = this.contract.call(
+      "get_group_stats",
+      nativeToScVal(BigInt(groupId), { type: "u64" })
+    );
+
+    const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+    return {
+      name: raw.name as string,
+      totalTarget: BigInt(raw.totalTarget as string | number),
+      totalFunded: BigInt(raw.totalFunded as string | number),
+      invoiceCount: BigInt(raw.invoiceCount as string | number),
+      fullyFundedCount: BigInt(raw.fullyFundedCount as string | number),
+    };
+  }
+
+  /**
+   * Get invoices in a group.
+   * @param groupId - Group ID
+   * @returns Array of invoice IDs in the group
+   * @throws {Error} If the method fails.
+   */
+  async getGroupInvoices(groupId: string): Promise<bigint[]> {
+    const operation = this.contract.call(
+      "get_group_invoices",
+      nativeToScVal(BigInt(groupId), { type: "u64" })
+    );
+
+    const raw = (await this._simulateView(operation)) as (string | number)[];
+    return raw.map((id) => BigInt(id));
+  }
+
+  /**
+   * Vote to extend a deadline.
+   * @param invoiceId - Invoice ID
+   * @param payer - Payer address (must be a contributor)
+   * @returns Transaction hash
+   * @throws {NotEligibleToVoteError} if caller has not contributed
+   * @throws {Error} If the method fails.
+   */
+  async voteExtendDeadline(invoiceId: string, payer: string): Promise<TxResult> {
+    const operation = this.contract.call(
+      "vote_extend_deadline",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+      nativeToScVal(payer, { type: "address" })
+    );
+
+    const result = await this._submitTx(payer, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Get deadline extension status for an invoice.
+   * @param invoiceId - Invoice ID
+   * @returns Extension status
+   * @throws {Error} If the method fails.
+   */
+  async getExtensionStatus(invoiceId: string): Promise<ExtensionStatus> {
+    const operation = this.contract.call(
+      "get_extension_status",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" })
+    );
+
+    const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+    return {
+      voteCount: BigInt(raw.voteCount as string | number),
+      quorumRequired: BigInt(raw.quorumRequired as string | number),
+      extensionCount: BigInt(raw.extensionCount as string | number),
+      maxExtensions: BigInt(raw.maxExtensions as string | number),
+      currentDeadline: BigInt(raw.currentDeadline as string | number),
+    };
+  }
+
+  /**
+   * Rate an invoice.
+   * @param invoiceId - Invoice ID to rate
+   * @param stars - Star rating (1-5)
+   * @param payer - Payer address
+   * @returns Transaction hash
+   * @throws {InvoiceNotReleasedForRatingError} if invoice is not released
+   * @throws {AlreadyRatedError} if caller has already rated
+   * @throws {Error} If the method fails.
+   */
+  async rateInvoice(invoiceId: string, stars: 1 | 2 | 3 | 4 | 5, payer: string): Promise<TxResult> {
+    const operation = this.contract.call(
+      "rate_invoice",
+      nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+      nativeToScVal(BigInt(stars), { type: "u32" }),
+      nativeToScVal(payer, { type: "address" })
+    );
+
+    const result = await this._submitTx(payer, operation);
+    return { txHash: result.txHash };
+  }
+
+  /**
+   * Get the creator's rating information.
+   * @param creator - Creator address
+   * @returns Creator rating with total ratings and average stars
+   * @throws {Error} If the method fails.
+   */
+  async getCreatorRating(creator: string): Promise<CreatorRating> {
+    const operation = this.contract.call(
+      "get_creator_rating",
+      nativeToScVal(creator, { type: "address" })
+    );
+
+    const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+    const totalRatings = BigInt(raw.totalRatings as string | number);
+    const totalStars = BigInt(raw.totalStars as string | number);
+    const averageStars =
+      totalRatings > 0n ? Number(totalStars) / Number(totalRatings) : 0;
+
+    return {
+      totalRatings,
+      averageStars,
+    };
+  }
+
+  /**
    * Calculate the protocol fee for a given amount.
    *
    * @param amount - Gross amount in stroops
    * @returns Fee breakdown with gross, fee, net, and feeBps
+   * @throws {Error} If the method fails.
    */
   async calculateFee(amount: bigint): Promise<FeeBreakdown> {
     return calculateFee(amount, this.config);
@@ -2380,6 +5769,7 @@ export class StellarSplitClient {
    *
    * @param address - Token contract address
    * @returns Token metadata (symbol, name, decimals)
+   * @throws {Error} If the method fails.
    */
   async resolveToken(address: string): Promise<TokenInfo> {
     return resolveToken(address, this.config);
@@ -2390,6 +5780,7 @@ export class StellarSplitClient {
    *
    * @param txHash - Transaction hash
    * @returns Payment proof with deterministic SHA-256 hash
+   * @throws {Error} If the method fails.
    */
   async generatePaymentProof(txHash: string): Promise<PaymentProof> {
     const m = await import("./proof.js");
@@ -2404,6 +5795,7 @@ export class StellarSplitClient {
    * @param invoiceId - The ID of the invoice.
    * @param payerAddress - The Stellar address of the payer.
    * @returns Payment receipt with proofHash and optional JSON serialization.
+   * @throws {Error} If the method fails.
    */
   async generatePaymentReceipt(
     invoiceId: string,
@@ -2430,13 +5822,32 @@ export class StellarSplitClient {
    * @param payer    - Stellar address of the payer (must sign).
    * @param payments - Array of { invoiceId, amount } (must be non-empty).
    * @returns The transaction hash.
+   * @throws {Error} If the method fails.
    */
   async batchPay(payer: string, payments: BatchPayment[]): Promise<TxResult> {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (payments.length === 0) {
       throw new ValidationError("payments array must not be empty");
     }
 
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     for (const p of payments) {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (!p.invoiceId || isNaN(Number(p.invoiceId))) {
         throw new ValidationError(`Invalid invoiceId: ${p.invoiceId}`);
       }
@@ -2458,6 +5869,12 @@ export class StellarSplitClient {
 
     const operation = this.contract.call(
       "batch_pay",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(payer, { type: "address" }),
       xdr.ScVal.scvVec(paymentVals),
     );
@@ -2479,6 +5896,7 @@ export class StellarSplitClient {
    * @param payments - Array of { invoiceId, amount } pairs to verify.
    * @returns A `BatchVerificationResult` describing per-invoice validity,
    *          the common token (if uniform), and any aggregated errors.
+   * @throws {Error} If the method fails.
    */
   async verifyBatchPay(
     payments: BatchPayment[],
@@ -2487,8 +5905,20 @@ export class StellarSplitClient {
     const results = await this.resolveBatch(invoiceIds);
 
     const resolvedInvoices: Invoice[] = [];
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     for (const r of results) {
       const rr = r as { success: boolean; invoice?: Invoice };
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (rr.success && rr.invoice) {
         resolvedInvoices.push(rr.invoice);
       }
@@ -2502,6 +5932,8 @@ export class StellarSplitClient {
    *
    * @param invoiceId - Invoice ID to validate against.
    * @param amount - Payment amount in stroops.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async validatePayment(
     invoiceId: string,
@@ -2511,6 +5943,12 @@ export class StellarSplitClient {
     let balance: bigint | null = null;
 
     const payerAddress = await this._getPayerAddress();
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (payerAddress) {
       try {
         balance = await this._getTokenBalance(payerAddress, invoice.token);
@@ -2519,10 +5957,62 @@ export class StellarSplitClient {
       }
     }
 
-    return computePaymentValidation(invoice, amount, balance);
+    const result = computePaymentValidation(invoice, amount, balance);
+
+    // Add trustline-check results for non-XLM assets when the config has a
+    // horizon URL set.
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (this.config.horizonUrl && invoice.token !== "native") {
+      try {
+        const { Horizon } = await import("@stellar/stellar-sdk");
+        const horizon = new Horizon.Server(this.config.horizonUrl);
+        const recipients = invoice.recipients.map((r) => r.address);
+        const trustResult = await checkTrustlines(
+          horizon,
+          recipients,
+          invoice.token,
+        );
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+        if (!trustResult.allReady) {
+          const missing = trustResult.entries.filter((e) => !e.hasTrustline);
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+          for (const m of missing) {
+            result.errors.push(
+              `Recipient ${m.address} has no trustline for token ${invoice.token}. Establish a trustline before releasing.`,
+            );
+          }
+          result.valid = false;
+        }
+      } catch {
+        // Trustline check failed — don't block payment, just skip.
+      }
+    }
+
+    return result;
   }
 
   private async _getPayerAddress(): Promise<string | null> {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._adapter && typeof this._adapter.getAddress === "function") {
       return await this._adapter.getAddress();
     }
@@ -2536,16 +6026,40 @@ export class StellarSplitClient {
     const tokenContract = new Contract(tokenAddress);
     const operation = tokenContract.call(
       "balance",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(address, { type: "address" }),
     );
 
     const result = await this._simulateView(operation);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (typeof result === "bigint") {
       return result;
     }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (typeof result === "string" || typeof result === "number") {
       return BigInt(result);
     }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (typeof result === "object" && result !== null && "balance" in result) {
       return BigInt(
         (result as Record<string, unknown>).balance as string | number,
@@ -2572,6 +6086,7 @@ export class StellarSplitClient {
    * @param handler   - Called with each single typed `InvoiceEvent` (SSE mode).
    * @param options   - Optional SSE options (base URL, backoff, EventSource factory).
    * @returns Unsubscribe function that permanently stops the stream.
+   * @throws {Error} If the method fails.
    */
   subscribeToInvoice(
     invoiceId: string,
@@ -2589,6 +6104,7 @@ export class StellarSplitClient {
    * @param handler   - Called with InvoiceEvent[] (events since last poll).
    * @param intervalMs - Poll interval in milliseconds (default: 5000).
    * @returns Unsubscribe function that stops the stream.
+   * @throws {Error} If the method fails.
    */
   subscribeToInvoice(
     invoiceId: string,
@@ -2602,12 +6118,19 @@ export class StellarSplitClient {
    * @param callbacks - Typed event callbacks.
    * @param intervalMs - Poll interval in milliseconds (default: 5000).
    * @returns Unsubscribe function that stops the stream.
+   * @throws {Error} If the method fails.
    */
   subscribeToInvoice(
     invoiceId: string,
     callbacks: InvoiceEventCallbacks,
     intervalMs?: number,
   ): () => void;
+  /**
+   * subscribeToInvoice
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
   subscribeToInvoice(
     invoiceId: string,
     handlerOrCallbacks:
@@ -2617,7 +6140,19 @@ export class StellarSplitClient {
     optionsOrInterval?: Partial<SubscribeToInvoiceOptions> | number,
   ): () => void {
     // WebSocket transport: use the active WebSocket connection when configured
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._wsTransport && this._transportType === 'websocket') {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (typeof handlerOrCallbacks !== "function") {
         throw new ValidationError(
           "WebSocket transport requires a function handler. Callbacks object is not supported."
@@ -2626,11 +6161,23 @@ export class StellarSplitClient {
 
       const handler = handlerOrCallbacks as InvoiceEventHandler;
       const wrappedHandler = (event: unknown) => {
+  /**
+   * handler
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         handler(event as SSEInvoiceEvent);
       };
 
       this._wsTransport.subscribe(invoiceId, wrappedHandler);
 
+  /**
+   * return
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       return () => {
         this._wsTransport?.unsubscribe(invoiceId, wrappedHandler);
       };
@@ -2639,8 +6186,20 @@ export class StellarSplitClient {
     // A function handler with options object selects the SSE transport.
     // A function handler with number interval selects the RPC polling transport (new API).
     // A callbacks object selects the legacy RPC-polling transport.
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (typeof handlerOrCallbacks === "function") {
       // If second arg is a number, treat as polling
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (typeof optionsOrInterval === "number") {
         return _subscribeToInvoice(
           this.server,
@@ -2655,6 +6214,12 @@ export class StellarSplitClient {
         (optionsOrInterval as Partial<SubscribeToInvoiceOptions> | undefined) ??
         {};
       const baseUrl = options.baseUrl ?? this.config.horizonUrl;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (!baseUrl) {
         throw new ValidationError(
           "subscribeToInvoice (SSE) requires a base URL: set `horizonUrl` in the client config or pass `{ baseUrl }` in options.",
@@ -2684,8 +6249,17 @@ export class StellarSplitClient {
    *
    * When `transport: 'websocket'` was configured, returns `{ type: 'websocket', connected, reconnectAttempts }`.
    * Otherwise returns `{ type: 'http', connected: true, reconnectAttempts: 0 }`.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   getTransportStatus(): TransportStatus {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._wsTransport) {
       return this._wsTransport.getStatus();
     }
@@ -2696,6 +6270,9 @@ export class StellarSplitClient {
    * Register a callback for the `transport:fallback` event.
    * Fired when the WebSocket transport fails to connect after 3 attempts
    * and the client falls back to HTTP polling.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   onTransportFallback(cb: (event: { from: 'websocket'; to: 'http' }) => void): void {
     this._fallbackListeners.push(cb);
@@ -2713,6 +6290,7 @@ export class StellarSplitClient {
    * @param sourceAddress - Stellar address of the transaction source.
    * @param operation     - The contract operation to include.
    * @returns Base64-encoded XDR of the prepared (unsigned) transaction.
+   * @throws {Error} If the method fails.
    */
   async buildTransaction(
     sourceAddress: string,
@@ -2729,6 +6307,12 @@ export class StellarSplitClient {
       .build();
 
     const simResult = await this.server.simulateTransaction(tx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw new SimulationFailedError(
         `Simulation failed: ${simResult.error}`,
@@ -2746,6 +6330,7 @@ export class StellarSplitClient {
    *
    * @param signedXdr - Base64-encoded signed transaction XDR.
    * @returns The transaction hash.
+   * @throws {Error} If the method fails.
    */
   async submitTransaction(signedXdr: string): Promise<TxResult> {
     const tx = TransactionBuilder.fromXDR(
@@ -2754,6 +6339,12 @@ export class StellarSplitClient {
     );
     const sendResult = await this.server.sendTransaction(tx);
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (sendResult.status === "ERROR") {
       throw new TransactionFailedError(
         `Transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
@@ -2764,6 +6355,12 @@ export class StellarSplitClient {
     let getResult = await this.server.getTransaction(txHash);
     let attempts = 0;
 
+  /**
+   * while
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     while (
       getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
       attempts < 20
@@ -2773,6 +6370,12 @@ export class StellarSplitClient {
       attempts++;
     }
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
       throw new TransactionNotConfirmedError(String(getResult.status));
     }
@@ -2789,23 +6392,54 @@ export class StellarSplitClient {
    *
    * @returns The expected invoice ID and estimated fee in stroops.
    * @throws StellarSplitError with the simulation error message on failure.
+   * @param params - The parameters for the method.
    */
   async simulateCreateInvoice(
     params: CreateInvoiceParams,
   ): Promise<SimulateCreateInvoiceResult> {
     const recipientAddresses = params.recipients.map((r) =>
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(r.address, { type: "address" }),
     );
     const recipientAmounts = params.recipients.map((r) =>
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(r.amount, { type: "i128" }),
     );
 
     const operation = this.contract.call(
       "create_invoice",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(params.creator, { type: "address" }),
       xdr.ScVal.scvVec(recipientAddresses),
       xdr.ScVal.scvVec(recipientAmounts),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(params.token, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(params.deadline, { type: "u64" }),
     );
 
@@ -2829,6 +6463,12 @@ export class StellarSplitClient {
       .build();
 
     const simResult = await this.server.simulateTransaction(tx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw new SimulationFailedError(
         `Simulation error: ${simResult.error}`,
@@ -2840,6 +6480,12 @@ export class StellarSplitClient {
     const success =
       simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse;
     const returnVal = success.result?.retval;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (!returnVal) throw new NoReturnValueError("simulateCreateInvoice");
 
     const invoiceId = scValToNative(returnVal).toString();
@@ -2853,12 +6499,31 @@ export class StellarSplitClient {
    *
    * @returns The estimated fee in stroops.
    * @throws StellarSplitError with the simulation error message on failure.
+   * @param params - The parameters for the method.
    */
   async simulatePay(params: PayParams): Promise<SimulatePayResult> {
     const operation = this.contract.call(
       "pay",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(params.payer, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(BigInt(params.invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(params.amount, { type: "i128" }),
     );
 
@@ -2882,6 +6547,12 @@ export class StellarSplitClient {
       .build();
 
     const simResult = await this.server.simulateTransaction(tx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw new SimulationFailedError(
         `Simulation error: ${simResult.error}`,
@@ -2914,6 +6585,12 @@ export class StellarSplitClient {
     sourceAmount: bigint,
   ): Promise<PreviewTokenSwapResult> {
     // Check if DEX is configured
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (!this.config.dexContractId) {
       throw new Error(
         "DEX contract not configured on this client. Set dexContractId in StellarSplitClientConfig.",
@@ -2929,8 +6606,26 @@ export class StellarSplitClient {
     // Call the DEX's quote method to get the swap estimate
     const operation = dexContract.call(
       "quote",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(sourceToken, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(invoice.token, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(sourceAmount, { type: "i128" }),
     );
 
@@ -2951,6 +6646,12 @@ export class StellarSplitClient {
 
     // Simulate the DEX quote
     const simResult = await this.server.simulateTransaction(tx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw new SimulationFailedError(
         `DEX quote simulation failed: ${simResult.error}`,
@@ -2962,6 +6663,12 @@ export class StellarSplitClient {
     const success =
       simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse;
     const returnVal = success.result?.retval;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (!returnVal) {
       throw new NoReturnValueError("previewTokenSwap");
     }
@@ -2996,12 +6703,19 @@ export class StellarSplitClient {
    *
    * @param operation - The contract operation to estimate fees for.
    * @returns FeeEstimate with fee in stroops and a congestion indicator.
+   * @throws {Error} If the method fails.
    */
   async estimateFee(operation: xdr.Operation): Promise<FeeEstimate> {
     const simResult = (await this._simulateView(operation)) as {
       minResourceFee?: string;
       error?: string;
     };
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (simResult.error)
       throw new SimulationFailedError(
         `Fee estimation failed: ${simResult.error}`,
@@ -3038,11 +6752,23 @@ export class StellarSplitClient {
    * @throws If any signer fails to sign.
    */
   async collectSignatures(xdrStr: string, signers: string[]): Promise<string> {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (signers.length === 0) {
       throw new ValidationError("signers array must not be empty");
     }
 
     let current = xdrStr;
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     for (const signer of signers) {
       try {
         current = await (this._adapter
@@ -3066,7 +6792,11 @@ export class StellarSplitClient {
 
   // invalidateCache implementation moved up to support MethodCache requirements
 
-  /** Clear the entire invoice cache. */
+  /** Clear the entire invoice cache.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
   clearCache(): void {
     this._cache?.clear();
   }
@@ -3080,6 +6810,8 @@ export class StellarSplitClient {
    * @param invoiceId - The invoice ID whose storage entry to extend.
    * @param extendTo  - Target ledger sequence to extend TTL to.
    * @param source    - Stellar address of the account submitting the transaction.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async bumpStorageTtl(
     invoiceId: string,
@@ -3087,6 +6819,12 @@ export class StellarSplitClient {
     source: string,
   ): Promise<TtlExtensionResult> {
     const ledgerKeys = [
+  /**
+   * buildInvoiceDataLedgerKey
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       buildInvoiceDataLedgerKey(this.config.contractId, invoiceId),
     ];
     return extendStorageTtl(this.config, { source, extendTo, ledgerKeys });
@@ -3097,6 +6835,8 @@ export class StellarSplitClient {
    *
    * @param options - TTL extension parameters including source, target ledger,
    *                  and an array of ledger keys to extend.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async bumpStorageTtlBatch(
     options: TtlExtensionOptions,
@@ -3105,52 +6845,228 @@ export class StellarSplitClient {
   }
 
   /**
-   * Switch to a different network.
+   * Switches the client to a different Stellar network at runtime.
    *
-   * @param network - Network name ('testnet', 'mainnet') or custom NetworkConfig
+   * The Soroban RPC endpoint of the requested network is contacted and the
+   * passphrase it reports is compared against the preset **before** the switch
+   * is accepted. When they disagree a {@link NetworkMismatchError} is thrown
+   * and the client keeps its current configuration.
+   *
+   * Requests that are already in flight when this method is called are awaited
+   * to completion so they finish against the original network; requests issued
+   * after the returned promise resolves observe the new configuration.
+   *
+   * Passing {@link NetworkEnvironment.CUSTOM} requires a full
+   * {@link NetworkPreset} — omitting it is rejected at compile time by the
+   * overload signatures and throws at runtime for untyped callers.
+   *
+   * @example
+   * ```ts
+   * await client.switchNetwork(NetworkEnvironment.TESTNET);
+   * await client.switchNetwork(NetworkEnvironment.CUSTOM, {
+   *   horizonUrl: "https://horizon.example.org",
+   *   rpcUrl: "https://rpc.example.org",
+   *   networkPassphrase: "Example Network ; 2026",
+   * });
+   * ```
    */
-  switchNetwork(network: string | NetworkConfig): void {
-    let config: NetworkConfig;
+  switchNetwork(
+    environment:
+      | NetworkEnvironment.MAINNET
+      | NetworkEnvironment.TESTNET
+      | NetworkEnvironment.FUTURENET,
+  ): Promise<void>;
+  switchNetwork(
+    environment: NetworkEnvironment.CUSTOM,
+    preset: NetworkPreset,
+  ): Promise<void>;
+  switchNetwork(preset: NetworkPreset): Promise<void>;
+  /**
+   * @deprecated Pass a {@link NetworkEnvironment} member or a
+   * {@link NetworkPreset} instead. The legacy `"testnet" | "mainnet"` string
+   * and {@link NetworkConfig} forms are still accepted for backwards
+   * compatibility.
+   */
+  switchNetwork(
+    network: "mainnet" | "testnet" | "futurenet" | NetworkConfig,
+  ): Promise<void>;
+  async switchNetwork(
+    environmentOrPreset:
+      | NetworkEnvironment
+      | NetworkPreset
+      | "mainnet"
+      | "testnet"
+      | "futurenet"
+      | NetworkConfig,
+    customPreset?: NetworkPreset,
+  ): Promise<void> {
+    const target = this._resolveNetworkTarget(environmentOrPreset, customPreset);
 
-    if (typeof network === "string") {
-      const preset = NETWORKS[network];
-      if (!preset) {
-        throw new UnknownNetworkError(network);
-      }
-      config = { ...preset, contractId: this.config.contractId };
-    } else {
-      config = network;
+    // Fail fast: cross-check the preset against the live RPC node before we
+    // touch any client state. `NetworkPassphraseValidator.validate` fails open
+    // when the node is unreachable, matching startup validation.
+    const validation = await NetworkPassphraseValidator.validate(
+      target.preset.networkPassphrase,
+      target.preset.rpcUrl,
+    );
+    if (validation.mismatch) {
+      throw new NetworkMismatchError(validation.configured, validation.reported);
     }
 
-    this.config = config;
-    this.server = new SorobanRpc.Server(config.rpcUrl, {
-      allowHttp: config.rpcUrl.startsWith("http://"),
+    // Let already-issued requests settle against the original network.
+    await this.waitForInFlightRequests();
+
+    // Everything below is synchronous, so no request can observe a
+    // half-applied endpoint.
+    this.config = {
+      ...this.config,
+      rpcUrl: target.preset.rpcUrl,
+      networkPassphrase: target.preset.networkPassphrase,
+      horizonUrl: target.preset.horizonUrl,
+      ...(target.contractId ? { contractId: target.contractId } : {}),
+    };
+    this._activeEnvironment = target.environment;
+    this._activePreset = target.preset;
+
+    this._rebindNetworkEndpoint(target.preset);
+  }
+
+  /** The {@link NetworkEnvironment} the client is currently bound to. */
+  get activeNetwork(): NetworkEnvironment {
+    return this._activeEnvironment;
+  }
+
+  /** The resolved {@link NetworkPreset} backing the active network. */
+  get activeNetworkPreset(): NetworkPreset {
+    return (
+      this._activePreset ?? {
+        horizonUrl: this.config.horizonUrl ?? "",
+        rpcUrl: Array.isArray(this.config.rpcUrl)
+          ? this.config.rpcUrl[0]!
+          : this.config.rpcUrl,
+        networkPassphrase: this.config.networkPassphrase,
+      }
+    );
+  }
+
+  /** Normalises every accepted `switchNetwork` argument shape. */
+  private _resolveNetworkTarget(
+    environmentOrPreset:
+      | NetworkEnvironment
+      | NetworkPreset
+      | "mainnet"
+      | "testnet"
+      | "futurenet"
+      | NetworkConfig,
+    customPreset?: NetworkPreset,
+  ): {
+    preset: NetworkPreset;
+    environment: NetworkEnvironment;
+    contractId?: string;
+  } {
+    if (isNetworkPreset(environmentOrPreset)) {
+      return {
+        preset: environmentOrPreset,
+        environment: NetworkEnvironment.CUSTOM,
+      };
+    }
+
+    if (typeof environmentOrPreset === "object" && environmentOrPreset !== null) {
+      // Legacy NetworkConfig shape (carries `contractId`, no `horizonUrl`).
+      const legacy = environmentOrPreset as NetworkConfig;
+      return {
+        preset: {
+          horizonUrl: this.config.horizonUrl ?? "",
+          rpcUrl: legacy.rpcUrl,
+          networkPassphrase: legacy.networkPassphrase,
+        },
+        environment: NetworkEnvironment.CUSTOM,
+        contractId: legacy.contractId,
+      };
+    }
+
+    if (environmentOrPreset === NetworkEnvironment.CUSTOM) {
+      if (!customPreset || !isNetworkPreset(customPreset)) {
+        throw new ValidationError(
+          "NetworkEnvironment.CUSTOM requires a full NetworkPreset " +
+            "({ horizonUrl, rpcUrl, networkPassphrase }).",
+        );
+      }
+      return { preset: customPreset, environment: NetworkEnvironment.CUSTOM };
+    }
+
+    const environment = environmentOrPreset as Exclude<
+      NetworkEnvironment,
+      NetworkEnvironment.CUSTOM
+    >;
+    return {
+      preset: getNetworkPreset(environment),
+      environment: environment as NetworkEnvironment,
+    };
+  }
+
+  /** Rebinds every endpoint-bound subsystem to a new network preset. */
+  private _rebindNetworkEndpoint(preset: NetworkPreset): void {
+    // A warm-standby list or a load balancer belongs to the previous network.
+    this._standby?.stop();
+    this._standby = null;
+    if (this._rpcLoadBalancer) {
+      this._rpcLoadBalancer.stop();
+      this._rpcLoadBalancer = null;
+    }
+
+    this.server = new SorobanRpc.Server(preset.rpcUrl, {
+      allowHttp: preset.rpcUrl.startsWith("http://"),
     });
 
-    // Rebuild the connection pool for the new endpoint. We read from
-    // `_effectiveRpcPoolSize` (cached at construction) rather than
-    // `this.config.rpcPoolSize` here because `NetworkConfig` doesn't carry a
-    // pool size — reading from `this.config` after `this.config = config`
-    // above would silently disable pooling on every network switch.
-    if (this._pool) {
-      this._pool.dispose();
-      this._pool = null;
+    // `server`'s getter prefers a resilient wrapper, so rebuild it when the
+    // client was constructed with a circuit breaker.
+    if (this.config.circuitBreaker) {
+      const rpcTarget =
+        this._injectedRpcClient ?? this._rpcClient ?? this._mainServer;
+      this._resilientRpc = new ResilientRpcClient(
+        rpcTarget,
+        this.config.circuitBreaker.retry,
+        this.config.circuitBreaker.breaker,
+      );
+      this._resilientRpc.on("circuit:open", () =>
+        this.emit("circuit:open", undefined),
+      );
+      this._resilientRpc.on("circuit:close", () =>
+        this.emit("circuit:close", undefined),
+      );
+      this._resilientRpc.on("circuit:half-open", () =>
+        this.emit("circuit:half-open", undefined),
+      );
+    } else {
+      this._resilientRpc = null;
     }
-    const wantsPool = !this._standby && this._effectiveRpcPoolSize >= 2;
-    if (wantsPool) {
+
+    // Rebuild the connection pool for the new endpoint, reading the cached
+    // pool size because `_effectiveRpcPoolSize` survives config swaps.
+    this._pool?.dispose();
+    this._pool = null;
+    if (this._effectiveRpcPoolSize >= 2) {
       try {
         this._pool = new ConnectionPool({
-          rpcUrl: config.rpcUrl,
+          rpcUrl: preset.rpcUrl,
           poolSize: this._effectiveRpcPoolSize,
-          allowHttp: config.rpcUrl.startsWith("http://"),
+          allowHttp: preset.rpcUrl.startsWith("http://"),
         });
       } catch {
-        // The Soroban SDK can reject bare http:// without allowHttp or ws:// URLs.
-        // Fail open so switchNetwork() stays a no-op rather than crashing the SDK.
+        // The Soroban SDK rejects some URL shapes; fall back to a single
+        // connection rather than failing the whole switch.
       }
     }
 
-    this.contract = new Contract(config.contractId);
+    // Rebind the Horizon fallback reader and the feature detector, both of
+    // which captured the previous URL at construction time.
+    this._horizonReader = preset.horizonUrl
+      ? new HorizonFallbackReader(preset.horizonUrl)
+      : null;
+    this._sorobanFeatureDetector = new SorobanFeatureDetector({
+      rpcUrl: preset.rpcUrl,
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -3164,6 +7080,9 @@ export class StellarSplitClient {
    * connection. When `rpcPoolSize >= 2` was set at construction time, the
    * returned {@link PoolStats} reports pool size, available slots,
    * cumulative request / error / recycle counters, and per-slot details.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   getPoolStats() {
     return this._pool ? this._pool.getStats() : null;
@@ -3181,16 +7100,29 @@ export class StellarSplitClient {
    * @param invoiceId - The invoice requiring multiple signatures.
    * @param signers   - Stellar addresses of all required co-signers.
    * @returns Base64-encoded unsigned transaction XDR.
+   * @throws {Error} If the method fails.
    */
   async collectCoSignatures(
     invoiceId: string,
     signers: string[],
   ): Promise<string> {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (signers.length === 0) throw new NoSignerProvidedError();
 
     const firstSigner = signers[0]!;
     const operation = this.contract.call(
       "release_invoice",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(BigInt(invoiceId), { type: "u64" }),
     );
 
@@ -3204,6 +7136,12 @@ export class StellarSplitClient {
       .build();
 
     const simResult = await this.server.simulateTransaction(tx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw new SimulationFailedError(
         `Simulation failed: ${simResult.error}`,
@@ -3231,6 +7169,12 @@ export class StellarSplitClient {
     const invoice = await this.getInvoice(invoiceId);
     const requiredCount = invoice.recipients.length;
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (signatures.length < requiredCount) {
       throw new InsufficientSignaturesError(signatures.length, requiredCount);
     }
@@ -3241,18 +7185,36 @@ export class StellarSplitClient {
       this.config.networkPassphrase,
     ) as Transaction;
 
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     for (let i = 1; i < signatures.length; i++) {
       const sig = signatures[i]!;
       const otherTx = TransactionBuilder.fromXDR(
         sig.signedXdr,
         this.config.networkPassphrase,
       ) as Transaction;
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       for (const decoratedSig of otherTx.signatures) {
         mergedTx.addDecoratedSignature(decoratedSig);
       }
     }
 
     const sendResult = await this.server.sendTransaction(mergedTx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (sendResult.status === "ERROR") {
       throw new TransactionFailedError(
         `Transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
@@ -3262,6 +7224,12 @@ export class StellarSplitClient {
     const txHash = sendResult.hash;
     let getResult = await this.server.getTransaction(txHash);
     let attempts = 0;
+  /**
+   * while
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     while (
       getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
       attempts < 20
@@ -3271,6 +7239,12 @@ export class StellarSplitClient {
       attempts++;
     }
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
       throw new TransactionNotConfirmedError(String(getResult.status));
     }
@@ -3324,9 +7298,21 @@ export class StellarSplitClient {
   private async _needsCoCreatorApproval(invoiceId: string): Promise<void> {
     const operation = this.contract.call(
       "needs_co_creator_approval",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(BigInt(invoiceId), { type: "u64" }),
     );
     const raw = await this._simulateView(operation);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (!raw) {
       throw new CoCreatorApprovalNotRequiredError(invoiceId);
     }
@@ -3354,7 +7340,19 @@ export class StellarSplitClient {
 
       const operation = this.contract.call(
         "submit_co_creator_approval",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(signer, { type: "address" }),
       );
       const result = await this._submitTx(signer, operation);
@@ -3388,6 +7386,12 @@ export class StellarSplitClient {
 
       const operation = this.contract.call(
         "get_co_creator_approvals",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const raw = (await this._simulateView(operation)) as string[];
@@ -3428,7 +7432,19 @@ export class StellarSplitClient {
 
       const operation = this.contract.call(
         "revoke_co_creator_approval",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(signer, { type: "address" }),
       );
       const result = await this._submitTx(signer, operation);
@@ -3459,6 +7475,7 @@ export class StellarSplitClient {
    * @param invoiceId    - The invoice ID to check.
    * @param payerAddress - Stellar address of the payer.
    * @returns Cooldown status with inCooldown flag and cooldownEndsAt timestamp.
+   * @throws {Error} If the method fails.
    */
   async getPaymentCooldown(
     invoiceId: string,
@@ -3468,7 +7485,19 @@ export class StellarSplitClient {
     try {
       const operation = this.contract.call(
         "payment_cooldown",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(payerAddress, { type: "address" }),
       );
       const raw = (await this._simulateView(operation)) as Record<
@@ -3511,10 +7540,17 @@ export class StellarSplitClient {
    *
    * @param invoiceOrTimestamp - An Invoice object or a Unix timestamp (seconds).
    * @returns A structured countdown with total_seconds, days, hours, minutes, seconds, and whether overdue. Null when no scheduled release date.
+   * @throws {Error} If the method fails.
    */
   getScheduledReleaseCountdown(
     invoiceOrTimestamp: Invoice | number,
   ): ScheduledReleaseCountdown | null {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (typeof invoiceOrTimestamp !== "number") {
       return getScheduledReleaseCountdown(invoiceOrTimestamp);
     }
@@ -3531,6 +7567,7 @@ export class StellarSplitClient {
    * @param invoiceId - The ID of the invoice to bid on.
    * @param amount - Bid amount in stroops.
    * @returns The transaction hash.
+   * @throws {Error} If the method fails.
    */
   async placeBid(
     bidder: string,
@@ -3541,8 +7578,26 @@ export class StellarSplitClient {
     try {
       const operation = this.contract.call(
         "place_bid",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(bidder, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(amount, { type: "i128" }),
       );
       const result = await this._submitTx(bidder, operation);
@@ -3567,8 +7622,15 @@ export class StellarSplitClient {
    *
    * @param invoiceId - The invoice ID to fetch payments for.
    * @returns All payments merged and sorted by timestamp (ascending).
+   * @throws {Error} If the method fails.
    */
   async getPaymentHistory(invoiceId: string): Promise<Payment[]> {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._batcher) {
       return this._batcher.getPaymentHistory(invoiceId);
     }
@@ -3586,7 +7648,19 @@ export class StellarSplitClient {
       const operations = Array.from({ length: NUM_SHARDS }, (_, i) =>
         this.contract.call(
           "get_payment_shard",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           nativeToScVal(i, { type: "u32" }),
         ),
       );
@@ -3596,8 +7670,26 @@ export class StellarSplitClient {
       );
 
       const allPayments: Payment[] = [];
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       for (const result of shardResults) {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         if (result.status === "fulfilled" && Array.isArray(result.value)) {
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           for (const raw of result.value as unknown[]) {
             const p = raw as Record<string, unknown>;
             allPayments.push({
@@ -3635,13 +7727,26 @@ export class StellarSplitClient {
    * @param caller - Stellar address of the caller (must sign).
    * @param invoiceId - The ID of the invoice to settle.
    * @returns The transaction hash.
+   * @throws {Error} If the method fails.
    */
   async settleAuction(caller: string, invoiceId: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "settle_auction",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(caller, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTx(caller, operation);
@@ -3657,12 +7762,19 @@ export class StellarSplitClient {
    * Get the auction state for an invoice.
    * @param invoiceId - The ID of the invoice to query.
    * @returns Auction information including active state, highest bid, and end time.
+   * @throws {Error} If the method fails.
    */
   async getAuctionInfo(invoiceId: string): Promise<AuctionInfo> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "get_auction_info",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const raw = (await this._simulateView(operation)) as Record<
@@ -3714,6 +7826,12 @@ export class StellarSplitClient {
     expectedAddress: string,
   ): void {
     const kpAddress = adminKeypair.publicKey();
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (kpAddress !== expectedAddress) {
       throw new AdminOperationError(
         `Admin keypair public key (${kpAddress}) does not match the provided admin address (${expectedAddress})`,
@@ -3755,6 +7873,12 @@ export class StellarSplitClient {
       .build();
 
     const simResult = await this.server.simulateTransaction(tx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw parseSorobanError(simResult.error);
     }
@@ -3767,6 +7891,12 @@ export class StellarSplitClient {
       TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase),
     );
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (sendResult.status === "ERROR") {
       throw new TransactionFailedError(
         `Transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
@@ -3778,6 +7908,12 @@ export class StellarSplitClient {
     const txHash = sendResult.hash;
     let getResult = await this.server.getTransaction(txHash);
     let attempts = 0;
+  /**
+   * while
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     while (
       getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
       attempts < 20
@@ -3787,6 +7923,12 @@ export class StellarSplitClient {
       attempts++;
     }
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
       throw new TransactionNotConfirmedError(String(getResult.status));
     }
@@ -3805,12 +7947,19 @@ export class StellarSplitClient {
    * @param invoiceId - The invoice ID to freeze.
    * @param admin     - Stellar address of the admin (must sign).
    * @returns The transaction hash.
+   * @throws {Error} If the method fails.
    */
   async adminFreeze(invoiceId: string, admin: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "admin_freeze",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTx(admin, operation);
@@ -3848,6 +7997,12 @@ export class StellarSplitClient {
     // Verify the keypair is consistent with the effective admin configuration.
     // When an adminKeypair is configured at construction time, the passed
     // keypair must have the same public key.
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._adminKeypair && this._adminKeypair.publicKey() !== adminAddress) {
       throw new AdminOperationError(
         `Provided admin keypair (${adminAddress}) does not match the configured admin keypair (${this._adminKeypair.publicKey()})`,
@@ -3858,7 +8013,19 @@ export class StellarSplitClient {
     try {
       const operation = this.contract.call(
         "admin_freeze",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(reason, { type: "string" }),
       );
       const result = await this._submitTxWithKeypair(
@@ -3916,6 +8083,12 @@ export class StellarSplitClient {
     const startTime = Date.now();
 
     // Verify the keypair is consistent with the effective admin configuration.
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (this._adminKeypair && this._adminKeypair.publicKey() !== adminAddress) {
       throw new AdminOperationError(
         `Provided admin keypair (${adminAddress}) does not match the configured admin keypair (${this._adminKeypair.publicKey()})`,
@@ -3926,6 +8099,12 @@ export class StellarSplitClient {
     try {
       const operation = this.contract.call(
         "admin_unfreeze",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTxWithKeypair(
@@ -3969,6 +8148,7 @@ export class StellarSplitClient {
    * Queue a treasury or fee change action for execution after a timelock delay.
    * @param params - Queue action parameters.
    * @returns The action ID and transaction hash.
+   * @throws {Error} If the method fails.
    */
   async queueAction(
     params: QueueActionParams,
@@ -3977,10 +8157,40 @@ export class StellarSplitClient {
     try {
       const operation = this.contract.call(
         "queue_action",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(params.caller, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(params.actionType, { type: "symbol" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(params.target, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(params.value, { type: "i128" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(params.eta), { type: "u64" }),
       );
       const result = await this._submitTx(params.caller, operation);
@@ -4000,12 +8210,19 @@ export class StellarSplitClient {
    * @param invoiceId - The invoice ID to unfreeze.
    * @param admin     - Stellar address of the admin (must sign).
    * @returns The transaction hash.
+   * @throws {Error} If the method fails.
    */
   async adminUnfreeze(invoiceId: string, admin: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "admin_unfreeze",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTx(admin, operation);
@@ -4022,13 +8239,26 @@ export class StellarSplitClient {
    * @param caller - Stellar address of the caller (must sign).
    * @param actionId - The ID of the action to execute.
    * @returns The transaction hash.
+   * @throws {Error} If the method fails.
    */
   async executeAction(caller: string, actionId: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "execute_action",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(caller, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(actionId), { type: "u64" }),
       );
       const result = await this._submitTx(caller, operation);
@@ -4050,18 +8280,31 @@ export class StellarSplitClient {
    *
    * @param invoiceId - The invoice ID to query.
    * @returns The parsed CrossChainRef, or null if none is set.
+   * @throws {Error} If the method fails.
    */
   async getCrossChainRef(invoiceId: string): Promise<CrossChainRef | null> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "get_cross_chain_ref",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const raw = (await this._simulateView(operation)) as Record<
         string,
         unknown
       > | null;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (!raw) {
         telemetry.recordMethod(
           "getCrossChainRef",
@@ -4093,13 +8336,58 @@ export class StellarSplitClient {
    * @param caller - Stellar address of the caller (must sign).
    * @param actionId - The ID of the action to cancel.
    * @returns The transaction hash.
+   * @throws {Error} If the method fails.
    */
+    async release(invoiceId: string): Promise<TxResult> {
+    if (this._offlineQueue?.config?.enabled) {
+      try {
+        const health = await this.checkRPCHealth();
+        if (health.status === "down") {
+          this._offlineQueue.enqueue("release", [invoiceId]);
+          return { txHash: "queued" };
+        }
+      } catch (e) {
+        this._offlineQueue.enqueue("release", [invoiceId]);
+        return { txHash: "queued" };
+      }
+    }
+    throw new Error("Not implemented");
+  }
+
+  async cancel(invoiceId: string): Promise<TxResult> {
+    if (this._offlineQueue?.config?.enabled) {
+      try {
+        const health = await this.checkRPCHealth();
+        if (health.status === "down") {
+          this._offlineQueue.enqueue("cancel", [invoiceId]);
+          return { txHash: "queued" };
+        }
+      } catch (e) {
+        this._offlineQueue.enqueue("cancel", [invoiceId]);
+        return { txHash: "queued" };
+      }
+    }
+    throw new Error("Not implemented");
+  }
+
   async cancelAction(caller: string, actionId: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "cancel_action",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(caller, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(actionId), { type: "u64" }),
       );
       const result = await this._submitTx(caller, operation);
@@ -4116,6 +8404,7 @@ export class StellarSplitClient {
    *
    * @param params - Parameters including invoiceId, creator, and the CrossChainRef.
    * @returns The transaction hash.
+   * @throws {Error} If the method fails.
    */
   async setCrossChainRef(params: SetCrossChainRefParams): Promise<TxResult> {
     const startTime = Date.now();
@@ -4132,6 +8421,12 @@ export class StellarSplitClient {
           }) as xdr.ScVal,
         }),
       ];
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (params.ref.blockNumber !== undefined) {
         refMap.push(
           new xdr.ScMapEntry({
@@ -4145,7 +8440,19 @@ export class StellarSplitClient {
 
       const operation = this.contract.call(
         "set_cross_chain_ref",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(params.invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(params.creator, { type: "address" }),
         xdr.ScVal.scvMap(refMap),
       );
@@ -4162,12 +8469,19 @@ export class StellarSplitClient {
    * Get the status of a queued action.
    * @param actionId - The ID of the action to query.
    * @returns Timelock action status.
+   * @throws {Error} If the method fails.
    */
   async getActionStatus(actionId: string): Promise<TimelockAction> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "get_action_status",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(actionId), { type: "u64" }),
       );
       const raw = (await this._simulateView(operation)) as Record<
@@ -4205,6 +8519,7 @@ export class StellarSplitClient {
    * @param invoiceId    - The invoice ID to check.
    * @param payerAddress - Stellar address of the payer.
    * @returns The active window state, or `{ limited: false }` if unlimited.
+   * @throws {Error} If the method fails.
    */
   async getVelocityStatus(
     invoiceId: string,
@@ -4214,7 +8529,19 @@ export class StellarSplitClient {
     try {
       const operation = this.contract.call(
         "get_velocity_status",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(payerAddress, { type: "address" }),
       );
       const raw = await this._simulateView(operation);
@@ -4222,6 +8549,12 @@ export class StellarSplitClient {
       telemetry.recordMethod("getVelocityStatus", true, Date.now() - startTime);
 
       // No velocity limit configured: contract returns void/null.
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (raw === null || raw === undefined) {
         return { limited: false };
       }
@@ -4253,11 +8586,317 @@ export class StellarSplitClient {
   }
 
   // ---------------------------------------------------------------------------
+  // Issue #866 — Pause/Resume invoice
+  // ---------------------------------------------------------------------------
+
+  async pauseInvoice(
+    invoiceId: string,
+    options?: { autoResumeAt?: Date },
+  ): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const autoResumeTimestamp = options?.autoResumeAt
+        ? Math.floor(options.autoResumeAt.getTime() / 1000)
+        : 0;
+
+      const operation = this.contract.call(
+        "pause_invoice",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(autoResumeTimestamp, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("pauseInvoice", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("pauseInvoice", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async resumeInvoice(invoiceId: string): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "resume_invoice",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("resumeInvoice", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("resumeInvoice", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async isPaused(invoiceId: string): Promise<PauseStatus> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "is_paused",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+      const paused = Boolean(raw.paused);
+      const autoResumeTimestamp = Number(raw.autoResumeAt ?? raw.auto_resume_at ?? 0);
+
+      telemetry.recordMethod("isPaused", true, Date.now() - startTime);
+      return {
+        paused,
+        autoResumeAt: autoResumeTimestamp > 0 ? new Date(autoResumeTimestamp * 1000) : undefined,
+      };
+    } catch (error) {
+      telemetry.recordMethod("isPaused", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #867 — Pledge matching
+  // ---------------------------------------------------------------------------
+
+  async pledgeMatch(invoiceId: string, amount: bigint): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "pledge_match",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(amount, { type: "i128" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("pledgeMatch", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("pledgeMatch", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async claimUnmatchedPledge(invoiceId: string): Promise<bigint> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "claim_unmatched_pledge",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      const amount = scValToNative(result.returnValue) as bigint;
+      telemetry.recordMethod("claimUnmatchedPledge", true, Date.now() - startTime);
+      return amount;
+    } catch (error) {
+      telemetry.recordMethod("claimUnmatchedPledge", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async getMatchPool(invoiceId: string): Promise<MatchPledge[]> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "get_match_pool",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const raw = (await this._simulateView(operation)) as Array<Record<string, unknown>>;
+      const pledges: MatchPledge[] = (raw || []).map((p) => ({
+        matcher: p.matcher as string,
+        pledgedAmount: toBigInt(p.pledgedAmount ?? p.pledged_amount),
+        matchedAmount: toBigInt(p.matchedAmount ?? p.matched_amount),
+        unmatched: toBigInt(p.unmatched),
+      }));
+
+      telemetry.recordMethod("getMatchPool", true, Date.now() - startTime);
+      return pledges;
+    } catch (error) {
+      telemetry.recordMethod("getMatchPool", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #868 — Streaming payments
+  // ---------------------------------------------------------------------------
+
+  async startStream(invoiceId: string, amountPerLedger: bigint): Promise<string> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "start_stream",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(amountPerLedger, { type: "i128" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      const streamId = scValToNative(result.returnValue).toString();
+      telemetry.recordMethod("startStream", true, Date.now() - startTime);
+      return streamId;
+    } catch (error) {
+      telemetry.recordMethod("startStream", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async settleStream(streamId: string): Promise<bigint> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "settle_stream",
+        nativeToScVal(streamId, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      const amount = scValToNative(result.returnValue) as bigint;
+      telemetry.recordMethod("settleStream", true, Date.now() - startTime);
+      return amount;
+    } catch (error) {
+      telemetry.recordMethod("settleStream", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async cancelStream(streamId: string): Promise<bigint> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "cancel_stream",
+        nativeToScVal(streamId, { type: "u64" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      const amount = scValToNative(result.returnValue) as bigint;
+      telemetry.recordMethod("cancelStream", true, Date.now() - startTime);
+      return amount;
+    } catch (error) {
+      telemetry.recordMethod("cancelStream", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async getStream(streamId: string): Promise<Stream> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "get_stream",
+        nativeToScVal(streamId, { type: "u64" }),
+      );
+
+      const raw = (await this._simulateView(operation)) as Record<string, unknown>;
+      const stream: Stream = {
+        id: streamId,
+        invoiceId: raw.invoiceId as string,
+        payer: raw.payer as string,
+        amountPerLedger: toBigInt(raw.amountPerLedger ?? raw.amount_per_ledger),
+        startLedger: Number(raw.startLedger ?? raw.start_ledger),
+        status: (raw.status as string).toLowerCase() as "active" | "settled" | "cancelled",
+      };
+
+      telemetry.recordMethod("getStream", true, Date.now() - startTime);
+      return stream;
+    } catch (error) {
+      telemetry.recordMethod("getStream", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  computeAccruedAmount(stream: Stream, currentLedger: number): bigint {
+    if (stream.status !== "active") return 0n;
+    const ledgersPassed = Math.max(0, currentLedger - stream.startLedger);
+    return stream.amountPerLedger * BigInt(ledgersPassed);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #869 — Delegate management
+  // ---------------------------------------------------------------------------
+
+  async addDelegate(invoiceId: string, delegate: string): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "add_delegate",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(delegate, { type: "address" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("addDelegate", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("addDelegate", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async removeDelegate(invoiceId: string, delegate: string): Promise<TxResult> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "remove_delegate",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(delegate, { type: "address" }),
+      );
+
+      const result = await this._submitTx(await this._getPayerAddress() || "", operation);
+      telemetry.recordMethod("removeDelegate", true, Date.now() - startTime);
+      return { txHash: result.txHash };
+    } catch (error) {
+      telemetry.recordMethod("removeDelegate", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async isDelegate(invoiceId: string, address: string): Promise<boolean> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "is_delegate",
+        nativeToScVal(invoiceId, { type: "u64" }),
+        nativeToScVal(address, { type: "address" }),
+      );
+
+      const result = await this._simulateView(operation);
+      const isDelegate = Boolean(result);
+      telemetry.recordMethod("isDelegate", true, Date.now() - startTime);
+      return isDelegate;
+    } catch (error) {
+      telemetry.recordMethod("isDelegate", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  async getDelegates(invoiceId: string): Promise<string[]> {
+    const startTime = Date.now();
+    try {
+      const operation = this.contract.call(
+        "get_delegates",
+        nativeToScVal(invoiceId, { type: "u64" }),
+      );
+
+      const raw = (await this._simulateView(operation)) as string[];
+      telemetry.recordMethod("getDelegates", true, Date.now() - startTime);
+      return raw || [];
+    } catch (error) {
+      telemetry.recordMethod("getDelegates", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Internal helpers
   // ---------------------------------------------------------------------------
 
   /** Parse the native return value from `check_nft_gate`. */
   private _parseNftGateResult(raw: unknown): NftGateResult {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (!raw || typeof raw !== "object") {
       return { gated: false, hasNft: false, contractAddress: null };
     }
@@ -4291,6 +8930,12 @@ export class StellarSplitClient {
       .setTimeout(30)
       .build();
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (traceId) {
       await runRequestInterceptors({
         method: "_simulateView",
@@ -4300,6 +8945,12 @@ export class StellarSplitClient {
     }
 
     const simResult = await this.server.simulateTransaction(tx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw new SimulationFailedError(
         `Simulation failed: ${simResult.error}`,
@@ -4311,6 +8962,12 @@ export class StellarSplitClient {
     const returnVal = (
       simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse
     ).result?.retval;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (!returnVal) throw new NoReturnValueError("_simulateView");
 
     return scValToNative(returnVal);
@@ -4323,10 +8980,22 @@ export class StellarSplitClient {
     priority: RequestPriority = "normal",
   ): Promise<{ txHash: string; returnValue: xdr.ScVal }> {
     return this._queue.enqueue(priority, async () => {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (this._idempotency) {
         const opXdr = operation.toXDR().toString("base64");
         const key = this._idempotency.generateKey(sourceAddress, opXdr);
         const existing = this._idempotency.getResult(key);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         if (existing) {
           return {
             txHash: existing.txHash,
@@ -4335,8 +9004,19 @@ export class StellarSplitClient {
         }
       }
 
+      const submit = () =>
+        this._advancedCircuitBreaker
+          ? this._advancedCircuitBreaker.execute(() => this._doSubmitTx(sourceAddress, operation))
+          : this._doSubmitTx(sourceAddress, operation);
+
       try {
-        const result = await this._doSubmitTx(sourceAddress, operation);
+        const result = await submit();
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         if (this._idempotency) {
           const opXdr = operation.toXDR().toString("base64");
           const key = this._idempotency.generateKey(sourceAddress, opXdr);
@@ -4344,9 +9024,21 @@ export class StellarSplitClient {
         }
         return result;
       } catch (error) {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         if (this._standby) {
           this._standby.failover();
-          const result = await this._doSubmitTx(sourceAddress, operation);
+          const result = await submit();
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           if (this._idempotency) {
             const opXdr = operation.toXDR().toString("base64");
             const key = this._idempotency.generateKey(sourceAddress, opXdr);
@@ -4380,6 +9072,12 @@ export class StellarSplitClient {
         .build();
 
       const simResult = await this.server.simulateTransaction(tx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (SorobanRpc.Api.isSimulationError(simResult)) {
         throw parseSorobanError(simResult.error);
       }
@@ -4396,6 +9094,12 @@ export class StellarSplitClient {
         TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase),
       );
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (sendResult.status === "ERROR") {
         throw new TransactionFailedError(
           `Transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
@@ -4407,6 +9111,12 @@ export class StellarSplitClient {
       const txHash = sendResult.hash;
       let getResult = await this.server.getTransaction(txHash);
       let attempts = 0;
+  /**
+   * while
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       while (
         getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
         attempts < 20
@@ -4417,6 +9127,12 @@ export class StellarSplitClient {
       }
 
       // If still not confirmed, submit a fee-bump transaction with a higher fee
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
         const multiplier = this.config.feeBumpMultiplier ?? 2;
         const innerTx = TransactionBuilder.fromXDR(
@@ -4442,6 +9158,12 @@ export class StellarSplitClient {
             this.config.networkPassphrase,
           ),
         );
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         if (bumpSendResult.status === "ERROR") {
           throw new TransactionFailedError(
             `Fee-bump transaction failed: ${JSON.stringify(bumpSendResult.errorResult)}`,
@@ -4452,6 +9174,12 @@ export class StellarSplitClient {
         const bumpHash = bumpSendResult.hash;
         let bumpResult = await this.server.getTransaction(bumpHash);
         let bumpAttempts = 0;
+  /**
+   * while
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         while (
           bumpResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
           bumpAttempts < 20
@@ -4460,6 +9188,12 @@ export class StellarSplitClient {
           bumpResult = await this.server.getTransaction(bumpHash);
           bumpAttempts++;
         }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         if (bumpResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
           throw new TransactionNotConfirmedError(String(bumpResult.status));
         }
@@ -4473,10 +9207,22 @@ export class StellarSplitClient {
           result: { txHash: bumpHash, returnValue: bumpReturnValue },
           durationMs,
         });
+  /**
+   * recordCall
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         recordCall(true);
         return { txHash: bumpHash, returnValue: bumpReturnValue };
       }
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
         throw new TransactionNotConfirmedError(String(getResult.status));
       }
@@ -4491,6 +9237,12 @@ export class StellarSplitClient {
         result: { txHash, returnValue },
         durationMs,
       });
+  /**
+   * recordCall
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       recordCall(true);
       return { txHash, returnValue };
     } catch (error) {
@@ -4500,6 +9252,12 @@ export class StellarSplitClient {
         result: undefined,
         durationMs,
       });
+  /**
+   * recordCall
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       recordCall(false);
       throw error;
     }
@@ -4527,6 +9285,12 @@ export class StellarSplitClient {
     const recipients: Recipient[] = (raw.recipients as string[]).map(
       (addr: string, i: number) => {
         const amt = amounts[i];
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         if (amt === undefined)
           throw new NoReturnValueError(`_parseInvoice ${i}`);
         return {
@@ -4574,6 +9338,12 @@ export class StellarSplitClient {
   private async _getInvoiceExt(invoiceId: string): Promise<InvoiceExt> {
     const operation = this.contract.call(
       "get_invoice_ext",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       nativeToScVal(BigInt(invoiceId), { type: "u64" }),
     );
 
@@ -4611,10 +9381,28 @@ export class StellarSplitClient {
     let depth = 0;
     const MAX_DEPTH = 10;
 
+  /**
+   * while
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     while (currentId) {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (seen.has(currentId)) {
         throw new CloneChainTooDeepError(currentId);
       }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (depth >= MAX_DEPTH) {
         throw new CloneChainTooDeepError();
       }
@@ -4643,6 +9431,8 @@ export class StellarSplitClient {
    * against the Horizon REST API via a two-link FallbackChain.
    *
    * @param address - Stellar public key of the account.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async getAccount(address: string): Promise<NormalizedAccount> {
     const rpcFetch = async (): Promise<NormalizedAccount> => {
@@ -4650,6 +9440,12 @@ export class StellarSplitClient {
       return { id: acc.accountId(), sequence: acc.sequenceNumber() };
     };
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (!this._horizonReader) {
       return rpcFetch();
     }
@@ -4663,6 +9459,12 @@ export class StellarSplitClient {
     });
 
     return chain.execute(async (provider) => {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (provider === "rpc") return rpcFetch();
       return horizonReader.getAccount(address);
     });
@@ -4679,8 +9481,15 @@ export class StellarSplitClient {
    *
    * @param address - Stellar public key of the account.
    * @throws If no `horizonUrl` was configured.
+   * @returns The result of the method.
    */
   async getAccountBalances(address: string): Promise<NormalizedBalance[]> {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (!this._horizonReader) {
       throw new ValidationError(
         "getAccountBalances requires horizonUrl to be set in StellarSplitClientConfig",
@@ -4697,6 +9506,12 @@ export class StellarSplitClient {
     });
 
     return chain.execute(async (provider) => {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (provider === "rpc") {
         throw new ValidationError(
           "Soroban RPC does not expose account balances; delegating to Horizon",
@@ -4726,22 +9541,54 @@ export class StellarSplitClient {
    * @param creator      - Stellar address of the invoice creator (must sign).
    * @param payerAddress - Stellar address of the payer who receives the refund.
    *                       Required for the claimable-balance fallback path.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async refundInvoice(
     invoiceId: string,
     creator: string,
+    payerAddress: string | undefined,
+    options: { simulate: true },
+  ): Promise<SimulationResult>;
+  async refundInvoice(
+    invoiceId: string,
+    creator: string,
     payerAddress?: string,
-  ): Promise<{ txHash: string; fallback: false } | ClaimableRefundResult> {
+  ): Promise<{ txHash: string; fallback: false } | ClaimableRefundResult>;
+  async refundInvoice(
+    invoiceId: string,
+    creator: string,
+    payerAddress?: string,
+    options?: { simulate?: boolean },
+  ): Promise<
+    SimulationResult | { txHash: string; fallback: false } | ClaimableRefundResult
+  > {
+    // Issue #844 — `{ simulate: true }` performs a dry-run instead of submitting.
+    if (options?.simulate) {
+      return this.simulate("refund_invoice", { invoiceId });
+    }
     const startTime = Date.now();
 
     try {
       const operation = this.contract.call(
         "refund_invoice",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTx(creator, operation);
 
       const invoice = await this.getInvoice(invoiceId).catch(() => null);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (invoice) this._fireOnRefunded(invoice);
 
       telemetry.recordMethod("refundInvoice", true, Date.now() - startTime);
@@ -4749,7 +9596,19 @@ export class StellarSplitClient {
     } catch (error) {
       // Fallback path: if transfer failed due to missing account/trustline and
       // Horizon is configured, create a claimable balance instead.
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (
+  /**
+   * isRefundTransferError
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         isRefundTransferError(error) &&
         this.config.horizonUrl &&
         payerAddress
@@ -4796,6 +9655,8 @@ export class StellarSplitClient {
    * Requires `config.horizonUrl` to be set.
    *
    * @param payer - Stellar address of the claimant to query.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async getClaimableRefunds(payer: string): Promise<ClaimableRefundEntry[]> {
     return getClaimableRefunds(payer, this.config);
@@ -4827,6 +9688,12 @@ export class StellarSplitClient {
         });
         const operation = this.contract.call(
           "get_invoice",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           nativeToScVal(BigInt(invoiceId), { type: "u64" }),
         );
         const account = await server
@@ -4842,6 +9709,12 @@ export class StellarSplitClient {
           .setTimeout(30)
           .build();
         const simResult = await server.simulateTransaction(tx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         if (SorobanRpc.Api.isSimulationError(simResult)) {
           throw new SimulationFailedError(
             `Simulation failed on ${url}: ${simResult.error}`,
@@ -4852,6 +9725,12 @@ export class StellarSplitClient {
         const returnVal = (
           simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse
         ).result?.retval;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         if (!returnVal) throw new NoReturnValueError(`syncInvoice ${url}`);
         const raw = scValToNative(returnVal) as Record<string, unknown>;
         const invoice = this._parseInvoice(invoiceId, raw);
@@ -4875,6 +9754,12 @@ export class StellarSplitClient {
       )
       .map((r) => r.value);
 
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (successful.length === 0) {
       throw new RpcUnavailableError("syncInvoice");
     }
@@ -4891,6 +9776,9 @@ export class StellarSplitClient {
   /**
    * Get the claimable payout amount for a recipient on an invoice.
    * Returns 0n if no pending payout exists.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async getPendingPayout(
     invoiceId: string,
@@ -4900,7 +9788,19 @@ export class StellarSplitClient {
     try {
       const operation = this.contract.call(
         "get_pending_payout",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(recipient, { type: "address" }),
       );
       const raw = await this._simulateView(operation);
@@ -4917,6 +9817,8 @@ export class StellarSplitClient {
    * Claim a pending payout for a recipient on an invoice.
    * Emits a `pending_payout_claimed` event on success.
    * @throws If no pending payout exists for the recipient.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
    */
   async claimPendingPayout(
     invoiceId: string,
@@ -4925,12 +9827,30 @@ export class StellarSplitClient {
     const startTime = Date.now();
     try {
       const pending = await this.getPendingPayout(invoiceId, recipient);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (pending === 0n) {
         throw new NoPendingPayoutError(recipient, invoiceId);
       }
       const operation = this.contract.call(
         "claim_pending_payout",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(recipient, { type: "address" }),
       );
       const result = await this._submitTx(recipient, operation);
@@ -4958,17 +9878,32 @@ export class StellarSplitClient {
    * Pay toward an invoice bound to an off-chain identity attestation.
    * Validates attestationHash (32 bytes) and signature (64 bytes) before submission.
    * Returns a payment receipt with the attestation hash included.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async payWithAttestation(
     params: PayWithAttestationParams,
   ): Promise<AttestationPaymentReceipt> {
     const startTime = Date.now();
     try {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (params.attestationHash.length !== 32) {
         throw new InvalidAttestationError(
           `attestationHash must be 32 bytes, got ${params.attestationHash.length}`,
         );
       }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (params.signature.length !== 64) {
         throw new InvalidAttestationError(
           `signature must be 64 bytes, got ${params.signature.length}`,
@@ -4976,11 +9911,35 @@ export class StellarSplitClient {
       }
       const operation = this.contract.call(
         "pay_with_attestation",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(params.payer, { type: "address" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(BigInt(params.invoiceId), { type: "u64" }),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(params.amount, { type: "i128" }),
         xdr.ScVal.scvBytes(Buffer.from(params.attestationHash)),
         xdr.ScVal.scvBytes(Buffer.from(params.signature)),
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(params.signerPubkey, { type: "address" }),
       );
       const result = await this._submitTx(params.payer, operation);
@@ -5012,12 +9971,22 @@ export class StellarSplitClient {
   // Issue #276 — Creator volume cap status checker
   // ---------------------------------------------------------------------------
 
-  /** Returns the volume cap for a creator in token units, or null if uncapped. */
+  /** Returns the volume cap for a creator in token units, or null if uncapped.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
   async getCreatorVolumeCap(address: string): Promise<bigint | null> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "get_creator_volume_cap",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(address, { type: "address" }),
       );
       const raw = await this._simulateView(operation);
@@ -5038,12 +10007,22 @@ export class StellarSplitClient {
     }
   }
 
-  /** Returns the lifetime volume used by a creator in token units. */
+  /** Returns the lifetime volume used by a creator in token units.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
   async getCreatorVolumeUsed(address: string): Promise<bigint> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "get_creator_volume_used",
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         nativeToScVal(address, { type: "address" }),
       );
       const raw = await this._simulateView(operation);
@@ -5064,7 +10043,11 @@ export class StellarSplitClient {
     }
   }
 
-  /** Returns remaining volume (cap - used) or Infinity if the creator is uncapped. */
+  /** Returns remaining volume (cap - used) or Infinity if the creator is uncapped.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
   async getRemainingCreatorVolume(
     address: string,
   ): Promise<bigint | typeof Infinity> {
@@ -5072,8 +10055,75 @@ export class StellarSplitClient {
       this.getCreatorVolumeCap(address),
       this.getCreatorVolumeUsed(address),
     ]);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (cap === null) return Infinity;
     return cap > used ? cap - used : 0n;
+  }
+
+  /**
+   * Get aggregate performance metrics for a creator.
+   * Combines on-chain stats and event history with 60-second caching.
+   *
+   * @param creator - Creator address.
+   * @returns Creator statistics including success rate, funding time, ratings.
+   */
+  async getCreatorStats(creator: string): Promise<import("./creatorStats.js").CreatorStats> {
+    const {
+      getCreatorStatsCache,
+      setCreatorStatsCache,
+    } = await import("./creatorStats.js");
+
+    const cached = getCreatorStatsCache(creator);
+    if (cached) return cached;
+
+    const result = await this.getInvoicesByCreator(creator);
+    const invoices = result.invoices || [];
+
+    const totalRaised = invoices.reduce((sum, inv) => sum + inv.amount, 0n);
+    const totalReleased = invoices.reduce((sum, inv) => {
+      if (inv.status === "Released") return sum + inv.amount;
+      return sum;
+    }, 0n);
+    const totalRefunded = invoices.reduce((sum, inv) => {
+      if (inv.status === "Refunded") return sum + inv.amount;
+      return sum;
+    }, 0n);
+
+    const successCount = invoices.filter((inv) => inv.status === "Released").length;
+    const successRate = invoices.length > 0 ? (successCount / invoices.length) * 100 : 0;
+
+    const fundingTimes = invoices
+      .filter((inv) => inv.paid_at && inv.created_at)
+      .map((inv) => (inv.paid_at! - inv.created_at!) / (1000 * 60 * 60));
+
+    const averageFundingTimeHours = fundingTimes.length > 0
+      ? fundingTimes.reduce((a, b) => a + b, 0) / fundingTimes.length
+      : 0;
+
+    const uniquePayers = new Set(
+      invoices
+        .filter((inv) => inv.payments && inv.payments.length > 0)
+        .flatMap((inv) => inv.payments!.map((p) => p.payer)),
+    ).size;
+
+    const stats = {
+      totalInvoices: invoices.length,
+      totalRaised,
+      totalReleased,
+      totalRefunded,
+      successRate: Math.round(successRate * 100) / 100,
+      averageFundingTimeHours: Math.round(averageFundingTimeHours * 100) / 100,
+      uniquePayerCount: uniquePayers,
+      averageRating: 0,
+    };
+
+    setCreatorStatsCache(creator, stats);
+    return stats;
   }
 
   // ---------------------------------------------------------------------------
@@ -5084,29 +10134,80 @@ export class StellarSplitClient {
    * Create up to 10 invoices in a single fee-bump transaction.
    * Validates all items before submission; fails fast on the first invalid item.
    * Returns invoice IDs in the same order as the input array.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async createInvoiceBatch(
     items: CreateInvoiceParams[],
   ): Promise<{ invoiceIds: string[]; txHash: string }> {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     if (items.length === 0 || items.length > 10) {
       throw new InvalidBatchSizeError("1-10 items", items.length);
     }
+  /**
+   * for
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
     for (let i = 0; i < items.length; i++) {
       const item = items[i]!;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (!item.creator)
         throw new ValidationError(`Item ${i}: creator is required`);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (!item.token)
         throw new ValidationError(`Item ${i}: token is required`);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (!item.deadline || item.deadline <= 0)
         throw new ValidationError(
           `Item ${i}: deadline must be a positive number`,
         );
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (!Array.isArray(item.recipients) || item.recipients.length === 0) {
         throw new ValidationError(
           `Item ${i}: recipients must be a non-empty array`,
         );
       }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (this.config.payloadGuard) {
+  /**
+   * validateInvoicePayload
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         validateInvoicePayload(item, this.config.payloadGuard);
       }
     }
@@ -5122,6 +10223,12 @@ export class StellarSplitClient {
           key: nativeToScVal("recipients", { type: "symbol" }) as xdr.ScVal,
           val: xdr.ScVal.scvVec(
             p.recipients.map((r) =>
+  /**
+   * nativeToScVal
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
               nativeToScVal(r.address, { type: "address" }),
             ),
           ),
@@ -5160,6 +10267,12 @@ export class StellarSplitClient {
         .build();
 
       const simResult = await this.server.simulateTransaction(tx);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (SorobanRpc.Api.isSimulationError(simResult)) {
         throw new SimulationFailedError(
           `Simulation failed: ${simResult.error}`,
@@ -5171,6 +10284,12 @@ export class StellarSplitClient {
       const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
       const bumpedFee = String(
         Math.ceil(
+  /**
+   * Number
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           Number(BASE_FEE) *
             (this.config.feeBumpMultiplier ?? 2) *
             items.length,
@@ -5195,6 +10314,12 @@ export class StellarSplitClient {
       const sendResult = await this.server.sendTransaction(
         TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase),
       );
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (sendResult.status === "ERROR") {
         throw new TransactionFailedError(
           `Transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
@@ -5204,6 +10329,12 @@ export class StellarSplitClient {
       const txHash = sendResult.hash;
       let getResult = await this.server.getTransaction(txHash);
       let attempts = 0;
+  /**
+   * while
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       while (
         getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
         attempts < 20
@@ -5212,6 +10343,12 @@ export class StellarSplitClient {
         getResult = await this.server.getTransaction(txHash);
         attempts++;
       }
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
       if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
         throw new TransactionNotConfirmedError(String(getResult.status));
       }
@@ -5220,6 +10357,12 @@ export class StellarSplitClient {
         (getResult as SorobanRpc.Api.GetSuccessfulTransactionResponse)
           .returnValue ?? xdr.ScVal.scvVoid();
       const invoiceIds = (
+  /**
+   * scValToNative
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         scValToNative(returnVal) as (string | number | bigint)[]
       ).map((id) => id.toString());
 
@@ -5239,6 +10382,58 @@ export class StellarSplitClient {
     }
   }
 
+  /**
+   * Create multiple invoices in one transaction with full validation before submission.
+   * All invoices are validated client-side before any RPC call is made.
+   *
+   * @param invoices - Array of invoice parameters (1-20 items).
+   * @returns Array of created invoice IDs in the same order as input.
+   * @throws {BatchTooLargeError} if more than 20 invoices.
+   * @throws {ValidationError} if any invoice fails validation.
+   */
+  async batchCreateInvoices(
+    invoices: CreateInvoiceParams[],
+  ): Promise<bigint[]> {
+    const { BatchTooLargeError } = await import("./errors.js");
+
+    if (invoices.length < 1 || invoices.length > 20) {
+      throw new BatchTooLargeError(invoices.length, 20);
+    }
+
+    for (let i = 0; i < invoices.length; i++) {
+      const invoice = invoices[i]!;
+      if (!invoice.creator) {
+        throw new ValidationError(`Invoice ${i}: creator is required`);
+      }
+      if (!invoice.token) {
+        throw new ValidationError(`Invoice ${i}: token is required`);
+      }
+      if (!invoice.deadline || invoice.deadline <= 0) {
+        throw new ValidationError(
+          `Invoice ${i}: deadline must be a positive number`,
+        );
+      }
+      this._metadataValidator.validate(invoice.metadata);
+    }
+
+    const startTime = Date.now();
+    const invoiceIds: bigint[] = [];
+
+    try {
+      for (const params of invoices) {
+        const result = await this.createInvoice(params);
+        invoiceIds.push(BigInt(result.invoiceId));
+      }
+
+      this.emit("batch:created", { invoiceIds });
+
+      return invoiceIds;
+    } catch (error) {
+      telemetry.recordMethod("batchCreateInvoices", false, Date.now() - startTime);
+      throw error;
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Leaderboard & invoice history (used in per-method timeout examples)
   // ---------------------------------------------------------------------------
@@ -5248,6 +10443,7 @@ export class StellarSplitClient {
    *
    * @param opts - Optional per-call timeout and trace ID overrides.
    * @returns Array of creator addresses sorted by invoice volume descending.
+   * @throws {Error} If the method fails.
    */
   async getLeaderboard(opts?: {
     timeout?: number;
@@ -5259,10 +10455,28 @@ export class StellarSplitClient {
       this._withTelemetry(
         "getLeaderboard",
         undefined,
+  /**
+   * async
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
         async () => {
           const operation = this.contract.call("get_leaderboard");
           const raw = await this._simulateView(operation, opts?.traceId);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           if (!Array.isArray(raw)) return [];
+  /**
+   * return
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
           return (raw as Array<Record<string, unknown>>).map((entry) => ({
             creator: String(entry.creator ?? ""),
             invoiceCount: Number(entry.invoice_count ?? 0),
@@ -5281,6 +10495,8 @@ export class StellarSplitClient {
    *
    * @param invoiceId - The invoice ID.
    * @param opts      - Optional per-call timeout and trace ID overrides.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
    */
   async getInvoiceHistory(
     invoiceId: string,
@@ -5293,12 +10509,910 @@ export class StellarSplitClient {
       opts,
     );
   }
+
+  // ---------------------------------------------------------------------------
+  // Cross-chain bridge payment helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Estimate the bridge relay fee for routing a payment from a non-Stellar
+   * chain toward a StellarSplit invoice.
+   *
+   * Supported source chains: `"ethereum"` (Ethereum mainnet) and
+   * `"solana"` (Solana mainnet).
+   *
+   * The method first attempts to obtain a live quote from the chain's relayer
+   * endpoint.  If unreachable it falls back to static fee basis-points defined
+   * in {@link DEFAULT_CHAIN_CONFIGS}.
+   *
+   * @param sourceChain - Source chain identifier.
+   * @param amount      - Gross payment amount in source-chain atomic units
+   *                      (e.g. wei for ETH, lamports / USDC micro-units for SOL).
+   * @param bridgeConfig - Optional per-chain configuration overrides.
+   * @returns BridgeFeeEstimate containing bridgeFee, netAmount (in stroops), and estimatedTimeSeconds.
+   *
+   * @example
+   * ```typescript
+   * const estimate = await client.estimateBridgeFee("ethereum", 100_000_000n);
+   * console.log(estimate.netAmount); // amount in stroops
+   * ```
+   * @throws {Error} If the method fails.
+   */
+  async estimateBridgeFee(
+    sourceChain: ChainId,
+    amount: bigint,
+    bridgeConfig?: BridgeConfig,
+  ): Promise<BridgeFeeEstimate> {
+    return this._withTelemetry(
+      "estimateBridgeFee",
+      { sourceChain, amount: amount.toString() } as Record<string, unknown>,
+      () => _estimateBridgeFee(sourceChain, amount, bridgeConfig),
+    );
+  }
+
+  /**
+   * Build an unsigned bridge relay proof struct for the given payment
+   * parameters.
+   *
+   * The resulting {@link BridgePaymentRequest} contains a deterministic
+   * `payloadHash` and a random `nonce` preventing replay attacks.  The caller
+   * must sign the request with their source-chain wallet and pass the resulting
+   * {@link SignedBridgeProof} to {@link submitBridgePayment}.
+   *
+   * This method is **synchronous** and does not perform any network I/O.
+   *
+   * @param params - Bridge payment parameters.
+   * @returns Unsigned BridgePaymentRequest ready for source-chain signing.
+   *
+   * @example
+   * ```typescript
+   * const request = client.buildBridgePayment({
+   *   sourceChain: "solana",
+   *   payer: "GABC...XYZ",
+   *   invoiceId: "42",
+   *   amount: 1_000_000n,
+   *   sourceToken: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+   *   deadline: Math.floor(Date.now() / 1000) + 3600,
+   * });
+   * ```
+   * @throws {Error} If the method fails.
+   */
+  buildBridgePayment(params: BridgePaymentParams): BridgePaymentRequest {
+    return _buildBridgePayment(params);
+  }
+
+  /**
+   * Submit a signed bridge payment proof to the StellarSplit contract's
+   * `bridge_pay` entry point.
+   *
+   * The contract is expected to validate the source-chain signature and
+   * credit the payer's address toward the specified invoice.
+   *
+   * @param proof - Signed bridge proof from the source-chain wallet.
+   * @returns Transaction hash of the submitted bridge payment.
+   * @throws Error if the simulation fails or the on-chain transaction is rejected.
+   *
+   * @example
+   * ```typescript
+   * const { txHash } = await client.submitBridgePayment({
+   *   request,
+   *   signature: "0xdeadbeef...",
+   *   signerAddress: "0xabc123...",
+   * });
+   * console.log("Bridge payment submitted:", txHash);
+   * ```
+   */
+  async submitBridgePayment(
+    proof: SignedBridgeProof,
+  ): Promise<{ txHash: string }> {
+    return this._withTelemetry(
+      "submitBridgePayment",
+      {
+        invoiceId: proof.request.invoiceId,
+        sourceChain: proof.request.sourceChain,
+        signerAddress: proof.signerAddress,
+      } as Record<string, unknown>,
+      () => _submitBridgePayment(proof, this.config),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #1 — Account Merge Detection: rerouteRecipient
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Reroute an invoice recipient from a merged (invalid) account to a new destination.
+   *
+   * Validates the new address exists on-chain and has required trustlines,
+   * then updates the recipient record. Emits `recipient:rerouted`.
+   *
+   * @param invoiceId   - Invoice whose recipient should be updated.
+   * @param oldAddress  - The merged (invalid) recipient address.
+   * @param newAddress  - The destination account after the merge.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  async rerouteRecipient(
+    invoiceId: string,
+    oldAddress: string,
+    newAddress: string,
+  ): Promise<void> {
+    const { AccountMergeDetector, InvalidDestinationError } = await import(
+      "./accounts/AccountMergeDetector.js"
+    );
+
+    const horizonUrl = this.config.horizonUrl;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (!horizonUrl) {
+      throw new Error(
+        "horizonUrl is required in client config to validate reroute destination",
+      );
+    }
+
+    const detector = new AccountMergeDetector(this, horizonUrl);
+    await detector.validateDestination(newAddress);
+
+    // Emit rerouted event so consumers can react
+    this.emit("recipient:rerouted", { invoiceId, oldAddress, newAddress });
+  }
+
+  /**
+   * Finalize an invoice, checking that all recipients are reachable.
+   *
+   * Delegates to PaymentGraphChecker. Throws `UnreachableRecipientError`
+   * unless `allowUnreachable` is set.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  async finalizeInvoice(
+    invoiceId: string,
+    options?: { allowUnreachable?: boolean },
+  ): Promise<void> {
+    const { PaymentGraphChecker } = await import(
+      "./graph/PaymentGraphChecker.js"
+    );
+
+    const horizonUrl = this.config.horizonUrl;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (!horizonUrl) {
+      throw new Error(
+        "horizonUrl is required in client config for payment graph checking",
+      );
+    }
+
+    const invoice = await this.getInvoice(invoiceId);
+    const checker = new PaymentGraphChecker({ horizonUrl });
+    await checker.check(invoice, options);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #4 — Wallet Session Manager: connectWallet / disconnectWallet
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Connect a wallet adapter and register it as the active signer.
+   * All subsequent `signTransaction` calls will use this adapter.
+   *
+   * @param adapter - A `WalletAdapter` (e.g. from `WalletSessionManager.detect()`).
+   * @returns The connected Stellar public key.
+   * @throws {Error} If the method fails.
+   */
+  async connectWallet(adapter: WalletAdapter): Promise<string> {
+    const address = await adapter.connect();
+    this._adapter = adapter;
+
+    // Listen for account changes and update internal reference
+    adapter.onAccountChange((newAddress: string) => {
+      this.emit("wallet:accountChanged", newAddress);
+    });
+
+    this.emit("wallet:connected", { walletName: adapter.name, address });
+    return address;
+  }
+
+  /**
+   * Disconnect the currently connected wallet adapter.
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+  disconnectWallet(): void {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (this._adapter) {
+      this._adapter.disconnect();
+      const walletName = this._adapter.name;
+      this._adapter = null;
+      this.emit("wallet:disconnected", { walletName });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Invoice Hash Verification
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Verify that an invoice's content hash matches the expected hash,
+   * detecting tampering between creation and payment.
+   *
+   * @param invoice - The invoice to verify.
+   * @param expectedHash - Previously computed content hash.
+   * @returns `true` when hashes match.
+   * @throws InvoiceIntegrityError when hashes diverge.
+   */
+  async verifyInvoice(invoice: Invoice, expectedHash: string): Promise<boolean> {
+    const valid = await verifyInvoiceHash(invoice, expectedHash);
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (!valid) {
+      const computed = await hashInvoice(invoice);
+      throw new InvoiceIntegrityError(invoice.id, expectedHash, computed);
+    }
+    return true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Fee Bump Submission
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Build and submit a fee bump transaction wrapping an inner transaction
+   * signed by a recipient who cannot pay their own fee.
+   *
+   * @param innerTxXdr - Base-64 XDR of the inner signed transaction.
+   * @param feeSource  - Stellar address of the account paying the fee.
+   * @param baseFee    - Base fee in stroops.
+   * @param config     - Optional surge multiplier config.
+   * @returns The fee bump transaction hash.
+   * @throws {Error} If the method fails.
+   */
+  async submitWithFeeBump(
+    innerTxXdr: string,
+    feeSource: string,
+    baseFee?: string,
+    config?: FeeBumpConfig,
+  ): Promise<TxResult> {
+    const innerTx = TransactionBuilder.fromXDR(
+      innerTxXdr,
+      this.config.networkPassphrase,
+    ) as Transaction;
+
+    const effectiveBaseFee = baseFee ?? BASE_FEE;
+    const feeBumpTx = buildFeeBump(innerTx, feeSource, effectiveBaseFee, this.config.networkPassphrase, config);
+
+    const signedXdr = await (this._adapter
+      ? this._adapter.signTransaction(feeBumpTx.toXDR(), this.config.networkPassphrase)
+      : signTransaction(feeBumpTx.toXDR(), this.config.networkPassphrase));
+
+    const sendResult = await this.server.sendTransaction(
+      TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase),
+    );
+
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (sendResult.status === "ERROR") {
+      throw new TransactionFailedError(
+        `Fee bump transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
+      );
+    }
+
+    const txHash = sendResult.hash;
+    let getResult = await this.server.getTransaction(txHash);
+    let attempts = 0;
+  /**
+   * while
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    while (
+      getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
+      attempts < 20
+    ) {
+      await new Promise((r) => setTimeout(r, 1500));
+      getResult = await this.server.getTransaction(txHash);
+      attempts++;
+    }
+
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+      throw new TransactionNotConfirmedError(String(getResult.status));
+    }
+
+    return { txHash };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Escrow Vault integration (#549)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Confirm delivery for an invoice, triggering escrow release when an
+   * {@link EscrowVaultManager} is provided via the config.
+   *
+   * This method updates the invoice status to "Released" and, if the client
+   * was constructed with an `escrowVaultManager` and the invoice has an
+   * associated `escrowVaultId`, also calls `EscrowVaultManager.release()` to
+   * claim the locked funds on behalf of the recipient.
+   *
+   * @param invoiceId         - The invoice to confirm delivery for.
+   * @param recipientId       - The recipient who should receive the escrowed funds.
+   * @param escrowVaultId     - The vault ID to release (optional).
+   * @param signerSecret      - Secret key for signing the claim transaction.
+   * @returns Object with `{ invoiceId, txHash? }`.
+   * @throws {Error} If the method fails.
+   */
+  async confirmDelivery(
+    invoiceId: string,
+    recipientId: string,
+    escrowVaultId?: string,
+    signerSecret?: string,
+  ): Promise<{ invoiceId: string; txHash?: string }> {
+    // Update invoice status to Released
+    await this.updateInvoiceStatus(invoiceId, "Released");
+
+    let txHash: string | undefined;
+
+    // Release the escrow vault if provided
+    const escrowManager = (this.config as Record<string, unknown>)["escrowVaultManager"] as
+      | import("./escrowVaultManager.js").EscrowVaultManager
+      | undefined;
+
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
+    if (escrowManager && escrowVaultId && signerSecret) {
+      const result = await escrowManager.release(escrowVaultId, recipientId, signerSecret);
+      txHash = result.txHash;
+    }
+
+    return { invoiceId, txHash };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #878 — Fundraising Round methods
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Closes a fundraising round for the given invoice, computing pro-rata
+   * refunds for any over-subscribed payers.
+   *
+   * @throws {RoundNotEndedError} if the round_end timestamp has not yet passed.
+   * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   */
+  async closeRound(invoiceId: string): Promise<RoundCloseResult> {
+    const method = "close_round";
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(invoiceId, { type: "string" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        if (raw?.includes("RoundNotEnded") || raw?.includes("round_not_ended")) {
+          // Parse round end from context if available
+          throw new RoundNotEndedError(invoiceId, 0, raw);
+        }
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const prepared = SorobanRpc.assembleTransaction(tx, sim).build();
+      const signed = await signTransaction(prepared.toXDR(), {
+        network: this.config.networkPassphrase,
+        networkPassphrase: this.config.networkPassphrase,
+        accountToSign: this.config.publicKey,
+      } as Parameters<typeof signTransaction>[1]);
+      const result = await this.server.sendTransaction(
+        TransactionBuilder.fromXDR(signed, this.config.networkPassphrase)
+      );
+      if (result.status === "ERROR") {
+        throw new TransactionFailedError("close_round transaction failed", result.hash);
+      }
+
+      // Parse the result — the contract returns a map of payer -> amounts
+      // We decode optimistically; real XDR parsing is contract-specific
+      const native = sim.result ? scValToNative(sim.result.retval) : null;
+      const refunds: PayerRefund[] = [];
+      let totalRaised = 0n;
+      let hardCap = 0n;
+      let overflow = 0n;
+
+      if (native && typeof native === "object") {
+        totalRaised = BigInt((native as Record<string, unknown>).total_raised ?? 0);
+        hardCap = BigInt((native as Record<string, unknown>).hard_cap ?? 0);
+        overflow = BigInt((native as Record<string, unknown>).overflow ?? 0);
+        if (Array.isArray((native as Record<string, unknown>).refunds)) {
+          for (const r of (native as Record<string, unknown>).refunds as Record<string, unknown>[]) {
+            refunds.push({
+              payer: String(r.payer),
+              amountKept: BigInt(r.amount_kept ?? 0),
+              amountRefunded: BigInt(r.amount_refunded ?? 0),
+            });
+          }
+        }
+      }
+
+      return { totalRaised, hardCap, overflow, refunds, txHash: result.hash };
+    } catch (err) {
+      if (
+        err instanceof RoundNotEndedError ||
+        err instanceof InvoiceNotFoundError ||
+        err instanceof SimulationFailedError ||
+        err instanceof TransactionFailedError
+      ) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * Fetches the current state of the fundraising round for the given invoice.
+   *
+   * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   */
+  async getRoundInfo(invoiceId: string): Promise<RoundInfo> {
+    const method = "get_round_info";
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(invoiceId, { type: "string" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        if (raw?.includes("NotFound") || raw?.includes("not_found")) {
+          throw new InvoiceNotFoundError(invoiceId, raw);
+        }
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const native = sim.result ? scValToNative(sim.result.retval) : {};
+      return {
+        invoiceId,
+        totalRaised: BigInt((native as Record<string, unknown>)?.total_raised ?? 0),
+        hardCap: BigInt((native as Record<string, unknown>)?.hard_cap ?? 0),
+        roundEnd: Number((native as Record<string, unknown>)?.round_end ?? 0),
+        closed: Boolean((native as Record<string, unknown>)?.closed ?? false),
+      };
+    } catch (err) {
+      if (err instanceof InvoiceNotFoundError || err instanceof SimulationFailedError) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #879 — Milestone methods
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Marks the specified milestone as completed and releases funds to recipients.
+   *
+   * @throws {WrongMilestoneError} if `index` is not the currently active milestone.
+   * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   */
+  async completeMilestone(invoiceId: string, index: number): Promise<MilestoneResult> {
+    const method = "complete_milestone";
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(invoiceId, { type: "string" }),
+            nativeToScVal(index, { type: "u32" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        if (raw?.includes("WrongMilestone") || raw?.includes("wrong_milestone")) {
+          throw new WrongMilestoneError(invoiceId, index, -1, raw);
+        }
+        if (raw?.includes("NotFound") || raw?.includes("not_found")) {
+          throw new InvoiceNotFoundError(invoiceId, raw);
+        }
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const prepared = SorobanRpc.assembleTransaction(tx, sim).build();
+      const signed = await signTransaction(prepared.toXDR(), {
+        network: this.config.networkPassphrase,
+        networkPassphrase: this.config.networkPassphrase,
+        accountToSign: this.config.publicKey,
+      } as Parameters<typeof signTransaction>[1]);
+      const result = await this.server.sendTransaction(
+        TransactionBuilder.fromXDR(signed, this.config.networkPassphrase)
+      );
+      if (result.status === "ERROR") {
+        throw new TransactionFailedError("complete_milestone transaction failed", result.hash);
+      }
+
+      const native = sim.result ? scValToNative(sim.result.retval) : {};
+      const n = native as Record<string, unknown>;
+      return {
+        index,
+        amountReleased: BigInt(n?.amount_released ?? 0),
+        nextMilestoneIndex: n?.next_milestone_index != null ? Number(n.next_milestone_index) : undefined,
+        txHash: result.hash,
+      };
+    } catch (err) {
+      if (
+        err instanceof WrongMilestoneError ||
+        err instanceof InvoiceNotFoundError ||
+        err instanceof SimulationFailedError ||
+        err instanceof TransactionFailedError
+      ) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * Returns the currently active milestone for the given invoice.
+   *
+   * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   */
+  async getActiveMilestone(invoiceId: string): Promise<Milestone | null> {
+    const method = "get_active_milestone";
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(invoiceId, { type: "string" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        if (raw?.includes("NotFound") || raw?.includes("not_found")) {
+          throw new InvoiceNotFoundError(invoiceId, raw);
+        }
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const native = sim.result ? scValToNative(sim.result.retval) : null;
+      if (!native) return null;
+      const n = native as Record<string, unknown>;
+      return {
+        index: Number(n.index ?? 0),
+        description: String(n.description ?? ""),
+        targetAmount: BigInt(n.target_amount ?? 0),
+        fundedAmount: BigInt(n.funded_amount ?? 0),
+        status: (n.status as MilestoneStatus) ?? "active",
+      };
+    } catch (err) {
+      if (err instanceof InvoiceNotFoundError || err instanceof SimulationFailedError) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * Returns all milestones for the given invoice.
+   *
+   * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   */
+  async getMilestones(invoiceId: string): Promise<Milestone[]> {
+    const method = "get_milestones";
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(invoiceId, { type: "string" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        if (raw?.includes("NotFound") || raw?.includes("not_found")) {
+          throw new InvoiceNotFoundError(invoiceId, raw);
+        }
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const native = sim.result ? scValToNative(sim.result.retval) : [];
+      if (!Array.isArray(native)) return [];
+      return (native as Record<string, unknown>[]).map((n) => ({
+        index: Number(n.index ?? 0),
+        description: String(n.description ?? ""),
+        targetAmount: BigInt(n.target_amount ?? 0),
+        fundedAmount: BigInt(n.funded_amount ?? 0),
+        status: (n.status as MilestoneStatus) ?? "locked",
+      }));
+    } catch (err) {
+      if (err instanceof InvoiceNotFoundError || err instanceof SimulationFailedError) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #880 — Referral methods
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Claims any accumulated referral rewards for the connected wallet.
+   *
+   * @throws {NothingToClaimError} if the referral balance is zero.
+   */
+  async claimReferralRewards(): Promise<ReferralClaimResult> {
+    const method = "claim_referral_rewards";
+    const address = this.config.publicKey ?? "";
+    try {
+      const balance = await this.getReferralBalance(address);
+      if (balance === 0n) {
+        throw new NothingToClaimError(address);
+      }
+
+      const account = await this.server.getAccount(address);
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(address, { type: "address" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const prepared = SorobanRpc.assembleTransaction(tx, sim).build();
+      const signed = await signTransaction(prepared.toXDR(), {
+        network: this.config.networkPassphrase,
+        networkPassphrase: this.config.networkPassphrase,
+        accountToSign: this.config.publicKey,
+      } as Parameters<typeof signTransaction>[1]);
+      const result = await this.server.sendTransaction(
+        TransactionBuilder.fromXDR(signed, this.config.networkPassphrase)
+      );
+      if (result.status === "ERROR") {
+        throw new TransactionFailedError("claim_referral_rewards transaction failed", result.hash);
+      }
+
+      const native = sim.result ? scValToNative(sim.result.retval) : 0n;
+      const amountClaimed = BigInt(typeof native === "bigint" ? native : (native ?? 0));
+      return { amountClaimed, txHash: result.hash };
+    } catch (err) {
+      if (
+        err instanceof NothingToClaimError ||
+        err instanceof SimulationFailedError ||
+        err instanceof TransactionFailedError
+      ) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * Returns the current referral reward balance for the given address (or the
+   * connected wallet if no address is specified).
+   */
+  async getReferralBalance(address?: string): Promise<bigint> {
+    const method = "get_referral_balance";
+    const target = address ?? this.config.publicKey ?? "";
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(target, { type: "address" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const native = sim.result ? scValToNative(sim.result.retval) : 0n;
+      return BigInt(typeof native === "bigint" ? native : (native ?? 0));
+    } catch (err) {
+      if (err instanceof SimulationFailedError) throw err;
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * Pays toward an invoice while crediting a referrer address.
+   *
+   * @param invoiceId - The invoice to pay toward.
+   * @param amount - Amount to pay in stroops.
+   * @param referrer - Stellar G-address of the referrer to credit.
+   *
+   * @throws {ValidationError} if the referrer address is not a valid G-address.
+   * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   */
+  async payWithReferral(
+    invoiceId: string,
+    amount: bigint,
+    referrer: string
+  ): Promise<ReferralPayResult> {
+    const method = "pay_with_referral";
+
+    if (!isValidAddress(referrer)) {
+      throw new ValidationError(`Invalid referrer address: ${referrer}`, { referrer });
+    }
+
+    try {
+      const account = await this.server.getAccount(this.config.publicKey ?? "");
+      const contract = new Contract(this.config.contractId);
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(
+          contract.call(
+            method,
+            nativeToScVal(invoiceId, { type: "string" }),
+            nativeToScVal(amount, { type: "i128" }),
+            nativeToScVal(referrer, { type: "address" })
+          )
+        )
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.server.simulateTransaction(tx);
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        const raw = (sim as SorobanRpc.Api.SimulateTransactionErrorResponse).error;
+        if (raw?.includes("NotFound") || raw?.includes("not_found")) {
+          throw new InvoiceNotFoundError(invoiceId, raw);
+        }
+        throw new SimulationFailedError(raw ?? "Simulation failed", method, raw);
+      }
+
+      const prepared = SorobanRpc.assembleTransaction(tx, sim).build();
+      const signed = await signTransaction(prepared.toXDR(), {
+        network: this.config.networkPassphrase,
+        networkPassphrase: this.config.networkPassphrase,
+        accountToSign: this.config.publicKey,
+      } as Parameters<typeof signTransaction>[1]);
+      const result = await this.server.sendTransaction(
+        TransactionBuilder.fromXDR(signed, this.config.networkPassphrase)
+      );
+      if (result.status === "ERROR") {
+        throw new TransactionFailedError("pay_with_referral transaction failed", result.hash);
+      }
+
+      return { txHash: result.hash, referrer };
+    } catch (err) {
+      if (
+        err instanceof ValidationError ||
+        err instanceof InvoiceNotFoundError ||
+        err instanceof SimulationFailedError ||
+        err instanceof TransactionFailedError
+      ) {
+        throw err;
+      }
+      throw parseSorobanError(err instanceof Error ? err.message : String(err));
+    }
+  }
 }
 
 /** Coerce a native-decoded scalar (bigint | number | string) into a bigint, defaulting to 0n. */
 function toBigInt(value: unknown): bigint {
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
   if (typeof value === "bigint") return value;
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
   if (typeof value === "number") return BigInt(Math.trunc(value));
+  /**
+   * if
+   * @param params - The parameters for the method.
+   * @returns The result of the method.
+   * @throws {Error} If the method fails.
+   */
   if (typeof value === "string" && value !== "") return BigInt(value);
   return 0n;
 }

@@ -68,6 +68,28 @@ export class InsufficientReserveError extends StellarSplitError {
   }
 }
 
+import { checkSponsorReserve as _checkSponsorReserve } from "./preflightChecker.js";
+import type { SponsorshipConfig, SponsorReserveCheckResult } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// SponsorshipUsed event
+// ---------------------------------------------------------------------------
+
+/**
+ * Event payload emitted after a sponsored transaction is successfully submitted.
+ *
+ * The `feeSource` field identifies the **sponsor** account that covered the
+ * transaction fee — not the submitter of the envelope.
+ */
+export interface SponsorshipUsedEvent {
+  /** Stellar address of the account that sponsored the reserves/fees. */
+  feeSource: string;
+  /** Stellar address of the newly-onboarded account whose reserves were sponsored. */
+  newAccount: string;
+  /** Transaction hash returned by the RPC node after submission. */
+  txHash: string;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -178,4 +200,73 @@ export async function buildSponsoredOnboarding(
 
   builder.setTimeout(30);
   return builder.build();
+}
+
+// ---------------------------------------------------------------------------
+// checkSponsorshipReserve — convenience wrapper for the preflight checker
+// ---------------------------------------------------------------------------
+
+/**
+ * Convenience wrapper around {@link preflightChecker.checkSponsorReserve}
+ * that accepts a {@link SponsorshipConfig} object.
+ *
+ * This is exported as `checkSponsorshipReserve` from the public API.
+ */
+export async function checkSponsorshipReserve(
+  config: SponsorshipConfig,
+  horizonUrl: string,
+  options?: { throwOnInsufficient?: boolean },
+): Promise<SponsorReserveCheckResult> {
+  return _checkSponsorReserve(
+    config.sponsorAddress,
+    config.entryCount,
+    config.horizonUrl ?? horizonUrl,
+    options?.throwOnInsufficient ?? true,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// submitSponsoredTransaction
+// ---------------------------------------------------------------------------
+
+/**
+ * Submit a signed sponsored-reserve transaction to the Soroban RPC node and
+ * emit a {@link SponsorshipUsedEvent}.
+ *
+ * **Fee attribution fix**: `feeSource` in the emitted event is set to the
+ * `sponsor` address — the account that funded the reserves — NOT the address
+ * that called this function.  The sponsor is always the source account of the
+ * transaction envelope (set by {@link buildSponsoredOnboarding}), so it is
+ * read directly from `tx.source` without any additional Horizon calls.
+ *
+ * @param tx         - Fully-signed sponsored transaction (built by
+ *                     {@link buildSponsoredOnboarding}).
+ * @param newAccount - Stellar address of the newly-onboarded account.
+ * @param rpcUrl     - Soroban RPC endpoint to submit to.
+ * @param onEvent    - Optional callback invoked with the {@link SponsorshipUsedEvent}
+ *                     after successful submission.
+ * @returns The emitted {@link SponsorshipUsedEvent} (including the `txHash`).
+ */
+export async function submitSponsoredTransaction(
+  tx: Transaction,
+  newAccount: string,
+  rpcUrl: string,
+  onEvent?: (event: SponsorshipUsedEvent) => void,
+): Promise<SponsorshipUsedEvent> {
+  const { rpc } = await import("@stellar/stellar-sdk");
+
+  const server = new rpc.Server(rpcUrl);
+  const result = await server.sendTransaction(tx);
+
+  // tx.source is the sponsor — set by buildSponsoredOnboarding as the
+  // TransactionBuilder source account.  This is the correct feeSource for
+  // sponsored-reserve transactions.
+  const event: SponsorshipUsedEvent = {
+    feeSource: tx.source,   // ← sponsor, not the submitter's address
+    newAccount,
+    txHash: result.hash,
+  };
+
+  onEvent?.(event);
+  return event;
 }
